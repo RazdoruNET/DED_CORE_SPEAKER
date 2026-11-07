@@ -1,0 +1,139 @@
+DED CORE SPEAKER — License Agreement (version 1.0, 2026)
+
+Copyright (c) 2023-2026 Ivanov Mikhail Sergeevich (WERAZDOR),
+Bogdanova Ekaterina Sergeevna (KCNC). All rights reserved.
+
+This agreement covers the smart speaker firmware, its documentation, protocol
+descriptions, configuration files and any related materials published in the
+smart-speaker directory ("the Software"). The terms below supersede any other
+licensing statement for this directory.
+
+1. DEFINITIONS
+--------------
+"The Software" means the source and object code, documentation, schematics,
+protocol descriptions, configuration files and other materials in the
+smart-speaker directory.
+"Derivative" means any modification of the Software, of any part of it, or any
+combination of the Software with other material, including firmware built from
+modified sources.
+"Commercial use" means any use directly or indirectly connected with gain:
+sale, rental, subscription, paid services, inclusion in a product, monetised
+service, advertising, paid training.
+"Distribution" means transferring a copy of the Software or a Derivative to
+third parties by any means: a file, a repository, a device image, publication.
+
+2. PERMITTED USE
+----------------
+Subject to this agreement you may:
+- use the Software for personal, educational and non-commercial purposes;
+- study, compile and run the Software on your own devices;
+- modify the Software for your own use;
+- distribute unmodified copies together with the full text of this agreement
+  and proper attribution;
+- publish your own Derivatives provided they are distributed under this
+  agreement (clause 3.2) and you clearly state that the version was modified,
+  by whom and which changes were made;
+- submit bug reports and suggestions for improvement.
+
+3. RESTRICTIONS
+---------------
+3.1. Commercial use of the Software or Derivatives, in whole or in part, is
+strictly prohibited without prior written permission from the copyright holder.
+
+3.2. Derivatives may be distributed only under this agreement, keeping all
+copyright notices and this text. Relicensing the Software under other terms,
+including free/open-source licences, is not permitted.
+
+3.3. You may not remove, hide or alter copyright notices, repository links or
+the text of this agreement.
+
+3.4. You may not use the names "DED CORE", "DED CORE SPEAKER", "DED CORE V4",
+the authors' names or their trademarks to advertise, promote, or present
+Derivatives as the official product of the copyright holder.
+
+3.5. You may not use the Software for covert recording, listening to or
+observing people without their informed and explicit consent, or in violation
+of applicable personal data law.
+
+3.6. You may not use the Software to bypass the platform's technical
+protections: server-side pairing signature verification, device authentication
+by long-term key, rate limits and audit, nor for unauthorised access to the
+infrastructure of the copyright holder or third parties.
+
+3.7. If you give third parties access to a device or service running a
+Derivative, you must provide them, on request, with the source code of your
+version and this agreement.
+
+4. DEVICE SAFETY
+----------------
+The speaker is a microphone inside a room and a remote control for a home. You
+are solely responsible for setup, physical protection of the device, Wi-Fi and
+account passwords, and for whom you grant access to your speakers. The
+copyright holder is not obliged to keep the Software working with any specific
+board, sensor set or server platform version.
+
+5. INTELLECTUAL PROPERTY
+------------------------
+All portions of the Software, including but not limited to:
+- source code files, firmware images, documentation, schematics;
+- protocol descriptions and frame formats;
+- configuration files and helper libraries,
+are the intellectual property of the copyright holder. No part of the Software
+may be reproduced, modified or distributed without attribution and compliance
+with this agreement.
+
+Platform signing private keys, device keys and service secrets are not part of
+the Software and are never published.
+
+6. CONTRIBUTIONS
+----------------
+By submitting fixes, patches or other material ("Contribution") you confirm
+that you hold the necessary rights and grant the copyright holder a perpetual,
+irrevocable, non-exclusive right to use, modify and distribute the Contribution
+under this agreement or other terms chosen by the copyright holder.
+
+7. TERMINATION
+--------------
+Any breach of this agreement terminates your rights automatically, without
+separate notice. On termination you must delete all copies of the Software and
+Derivatives, including built images and publications. Termination does not
+release you from liability for a breach committed before it.
+
+8. DISCLAIMER OF WARRANTY
+-------------------------
+The Software is provided "AS IS", without warranty of any kind, express or
+implied, including the warranties of merchantability, fitness for a particular
+purpose, noninfringement and absence of vulnerabilities. The copyright holder
+does not warrant that the Software resists every attack.
+
+9. LIMITATION OF LIABILITY
+--------------------------
+To the maximum extent permitted by law, the copyright holder is not liable for
+any damage arising from the use or inability to use the Software: data loss,
+leakage of passwords or voice recordings, unauthorised device access, lost
+profit, property damage, injury and other consequences, even if such damage was
+foreseeable.
+
+10. CHANGES TO THIS AGREEMENT
+-----------------------------
+The copyright holder may publish new versions of this agreement. Rights granted
+under an already published version are preserved for that version.
+
+11. GOVERNING LAW
+-----------------
+This agreement is governed by and construed in accordance with the laws of the
+Russian Federation. The place of dispute resolution is Veliky Novgorod.
+
+CONTACT
+-------
+Commercial licensing, other permissions and security reports:
+
+razdoru.net@yandex.ru
+katya.bog2311@gmail.com
+https://vk.com/ded_moto_sys
+https://dedbox.pro
+
+---
+
+This agreement is not an OSI-approved licence: commercial use is prohibited.
+Russian version — in the LICENSE file.
