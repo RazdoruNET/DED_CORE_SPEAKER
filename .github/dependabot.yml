@@ -1,0 +1,12 @@
+version: 2
+
+# У прошивки зависимость одна — платформа PlatformIO и библиотеки из lib_deps;
+# их версии фиксирует platformio.ini. Автообновление здесь ограничено экшенами CI,
+# чтобы не притащить в прошивку новую версию библиотеки без проверки на железе.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
