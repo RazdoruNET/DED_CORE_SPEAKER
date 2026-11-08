@@ -25,16 +25,29 @@ constexpr uint32_t kMicFrameMs = 1000u * AUDIO_FRAME_SAMPLES / AUDIO_RATE;
 // Отправка сорвалась: кадр ушёл не целиком, поток потерял синхронизацию.
 bool sendFailed = false;
 
-// Цепочка доверия: локальный CA стенда плюс публичные корни. Возвращаем ссылку
-// на статическую строку: библиотека хранит указатель, а не копию, и копия на
-// стеке к моменту подключения уже мертва.
+// Цепочка доверия: по умолчанию только CA платформы.
+//
+// Публичные корни рядом с пином — это не «запасной путь», а его отмена: доверие
+// расширяется до любого публичного CA (и до корпоративного MITM-прокси), и подделать
+// сервер сможет тот, кто получит у него сертификат на наш домен. В HELLO при этом
+// уходит ключ устройства, то есть последствие — захват аккаунта колонки.
+//
+// Если сервер серии подписан не CA платформы, включите SPEAKER_ALLOW_PUBLIC_ROOTS
+// осознанно (см. docs/09-production-security.md) — по умолчанию флага нет.
+// Возвращаем ссылку на статическую строку: библиотека хранит указатель, а не копию,
+// и копия на стеке к моменту подключения уже мертва.
 const String& trustedRoots() {
   static String chain;
   if (chain.isEmpty()) {
+#ifdef SPEAKER_ALLOW_PUBLIC_ROOTS
     chain.reserve(strlen(SPEAKER_ROOT_CA_PEM) + strlen(SPEAKER_PUBLIC_ROOTS_PEM) + 2);
     chain += SPEAKER_ROOT_CA_PEM;
     chain += "\n";
     chain += SPEAKER_PUBLIC_ROOTS_PEM;
+#else
+    chain.reserve(strlen(SPEAKER_ROOT_CA_PEM) + 1);
+    chain += SPEAKER_ROOT_CA_PEM;
+#endif
   }
 
   return chain;
