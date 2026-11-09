@@ -111,8 +111,10 @@ bool BlePairing::begin(PairingCrypto* crypto, const String& deviceId, PairedHand
   info["profile"] = SPEAKER_PROFILE_NAME;
   info["pub"] = toHex(crypto->publicKey(), PairingCrypto::PUBLIC_KEY_SIZE);
   info["paired"] = deviceConfig.isPaired();
-  // Какую версию кадра принимает устройство: 2 — Wi-Fi пароль шифруется с
-  // участием кода с наклейки, 1 — только ECDH. Сайт обязан использовать ту же.
+  // Подсказка для сайта: какую версию кадра принимает устройство (2 — Wi-Fi
+  // пароль шифруется с участием кода с наклейки, 1 — только ECDH). Характеристика
+  // не аутентифицирована, поэтому версию диктует сервер через подписанный grant,
+  // а сайт обязан использовать именно его.
   info["frame"] = crypto->requiredFrameVersion();
   String infoJson;
   serializeJson(info, infoJson);
@@ -349,7 +351,7 @@ void BlePairing::handleFrame() {
       || !challenge.equalsIgnoreCase(_challenge)
       || api != signedApi
       || !_crypto->verifyServerGrant(grantDeviceId, publicKeySha256, challenge,
-                                     userId, token, signedApi, signature)) {
+                                     userId, token, signedApi, version, signature)) {
     report("error", false, "grant_signature");
     return;
   }

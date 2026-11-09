@@ -84,12 +84,18 @@ class AudioPipeline {
   /// До какого момента микрофон молчит принудительно (0 — не молчит).
   volatile uint32_t _hushUntil = 0;
 
+  /// Захват останавливали посреди фразы: задаче записи нужно сбросить VAD.
+  volatile bool _flushVad = false;
+
   volatile uint32_t _peakRmsWindow = 0;
   volatile uint32_t _peakZcrWindow = 0;
 
   int16_t* _preroll = nullptr;
   size_t _prerollFrames = 0;
   size_t _prerollWrite = 0;
+
+  /// Сколько кадров в кольце преролла действительно записано с прошлого сброса.
+  size_t _prerollValid = 0;
 
   uint8_t _volume = 60;
   uint32_t _lastRms = 0;

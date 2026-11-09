@@ -37,8 +37,9 @@ class PairingCrypto {
   // Wi-Fi защищён только ECDH — его прочитает подставное BLE-устройство.
   bool hasPairCode() const { return _pairCode.length() > 0; }
 
-  // Какую версию кадра принимает устройство. Сайт читает её из BLE info и
-  // выбирает тот же вывод ключа; кадр другой версии устройство отвергает.
+  // Какую версию кадра принимает устройство. Версию диктует сервер: она входит
+  // в подписанный grant, а кадр другой версии устройство отвергает. Поле
+  // `frame` в BLE info — только подсказка для сайта, ей доверять нельзя.
   uint8_t requiredFrameVersion() const { return hasPairCode() ? 2 : 1; }
 
   // Расшифровывает кадр привязки.
@@ -66,6 +67,7 @@ class PairingCrypto {
       const String& userId,
       const String& pairToken,
       const String& apiBase,
+      uint8_t frameVersion,
       const String& signatureBase64);
 
  private:

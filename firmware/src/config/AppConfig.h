@@ -41,7 +41,7 @@ inline bool speakerSecureFlashEnabled() { return true; }
 // ---------------------------------------------------------------------------
 // Идентификация устройства и версия
 // ---------------------------------------------------------------------------
-#define SPEAKER_FIRMWARE_VERSION "0.2.0"
+#define SPEAKER_FIRMWARE_VERSION "0.2.2"
 #define SPEAKER_PRODUCT          "smart-speaker"
 
 #if defined(DEVICE_PROFILE_S3)
@@ -287,7 +287,7 @@ constexpr uint32_t SNEEZE_RMS_START   = 4000;
 constexpr uint32_t SNEEZE_QUIET_MS    = 800;
 constexpr uint16_t SNEEZE_MIN_FRAMES  = 4;
 constexpr uint16_t SNEEZE_MAX_FRAMES  = 18;
-constexpr uint32_t SNEEZE_COOLDOWN_MS = 4000;
+constexpr uint32_t SNEEZE_COOLDOWN_MS = 15000;
 constexpr int MAX_PHRASE_FRAMES = MAX_PHRASE_MS / AUDIO_FRAME_MS;
 constexpr int MIN_SPEECH_FRAMES = MIN_SPEECH_MS / AUDIO_FRAME_MS;
 

@@ -240,6 +240,10 @@ void AudioPipeline::micLoop() {
   size_t bytesRead = 0;
   uint16_t silenceFrames = 0;
   uint16_t speechFrames = 0;
+  // Длина фразы по времени, а не по числу громких кадров: в шумной комнате
+  // уровень гуляет ниже порога, speechFrames растёт медленно, и фраза
+  // растягивалась на 20–40 с. Сервер такие куски отбрасывал как «музыку».
+  uint16_t phraseFrames = 0;
   bool voiceActive = false;
   int warmupFrames = MIC_WARMUP_FRAMES;
   uint16_t micReadProbe = 0;
@@ -289,11 +293,32 @@ void AudioPipeline::micLoop() {
         voiceActive = false;
         speechFrames = 0;
         silenceFrames = 0;
+        phraseFrames = 0;
         _capturing = false;
         continue;
       }
 
       _hushUntil = 0;
+    }
+
+    // Захват останавливали посреди фразы (заговорил агент, включился mute):
+    // состояние детектора надо сбросить, иначе после возобновления звук уйдёт
+    // без события «начало речи» и склеится с прошлой фразой.
+    if (_flushVad) {
+      _flushVad = false;
+      voiceActive = false;
+      speechFrames = 0;
+      silenceFrames = 0;
+      phraseFrames = 0;
+
+      // Преролл тоже забываем: иначе в начало следующей команды попадёт голос
+      // агента из динамика или звук, снятый при выключенном микрофоне.
+      _prerollWrite = 0;
+      _prerollValid = 0;
+
+      sneezeActive = false;
+      sneezeFrames = 0;
+      sneezePending = false;
     }
 
     // Буфер чередуется: левый, правый, левый, правый...
@@ -404,8 +429,15 @@ void AudioPipeline::micLoop() {
 
     const uint32_t nowMs = millis();
 
+    // Чих ищем только в тишине и только при включённом микрофоне: на музыке и
+    // шуме всплеск «чиха» ловится постоянно, а сервер на него отвечал целой
+    // задачей ассистенту. Порог считаем от фона, а не абсолютным числом.
+    const uint32_t sneezeThreshold = max<uint32_t>(
+        SNEEZE_RMS_START, noiseFloor > 0 ? static_cast<uint32_t>(noiseFloor) * 8 : 0);
+
     if (!sneezeActive) {
-      if (rms >= SNEEZE_RMS_START && nowMs - _lastSneezeAt >= SNEEZE_COOLDOWN_MS) {
+      if (_capturing && !voiceActive && rms >= sneezeThreshold
+          && nowMs - _lastSneezeAt >= SNEEZE_COOLDOWN_MS) {
         sneezeActive = true;
         sneezeFrames = 1;
       }
@@ -427,7 +459,10 @@ void AudioPipeline::micLoop() {
     }
 
     if (sneezePending) {
-      if (rms > 1200) {
+      if (!_capturing) {
+        // Микрофон выключили посреди всплеска — «чиха» не было.
+        sneezePending = false;
+      } else if (rms > 1200) {
         sneezePending = false;
       } else if (nowMs - sneezePendingAt >= SNEEZE_QUIET_MS) {
         sneezePending = false;
@@ -502,12 +537,6 @@ void AudioPipeline::micLoop() {
     const uint32_t levelRms = rmsOf(pixelBuffer, used);
     _lastRms = levelRms;
 
-    if (!voiceActive && _preroll != nullptr && _prerollFrames > 0) {
-      memcpy(_preroll + _prerollWrite * AUDIO_FRAME_SAMPLES, pixelBuffer,
-             AUDIO_FRAME_SAMPLES * sizeof(int16_t));
-      _prerollWrite = (_prerollWrite + 1) % _prerollFrames;
-    }
-
     if (!_capturing) {
       if (_onLevel) {
         _onLevel(static_cast<uint8_t>(min<uint32_t>(255, levelRms / MIC_LEVEL_DIVISOR)));
@@ -515,24 +544,44 @@ void AudioPipeline::micLoop() {
       continue;
     }
 
+    // Преролл пишем только при включённом микрофоне. Иначе после mute на сервер
+    // первым же кадром уходил звук, записанный при выключенном захвате, — это
+    // нарушало обещание «пока mute, кадры не уходят».
+    if (!voiceActive && _preroll != nullptr && _prerollFrames > 0) {
+      memcpy(_preroll + _prerollWrite * AUDIO_FRAME_SAMPLES, pixelBuffer,
+             AUDIO_FRAME_SAMPLES * sizeof(int16_t));
+      _prerollWrite = (_prerollWrite + 1) % _prerollFrames;
+
+      if (_prerollValid < _prerollFrames) {
+        ++_prerollValid;
+      }
+    }
+
     if (!voiceActive) {
       if (rms >= vadOn) {
         voiceActive = true;
         silenceFrames = 0;
         speechFrames = 0;
+        phraseFrames = 0;
         if (_onVad) {
           _onVad(true, rms);
         }
-        // Отдаём то, что накопилось до срабатывания: начало фразы уже сказано.
-        if (_preroll != nullptr && _prerollFrames > 0) {
-          for (size_t frame = 0; frame < _prerollFrames; ++frame) {
-            const size_t index = (_prerollWrite + frame) % _prerollFrames;
+        // Отдаём только реально записанные кадры: после сброса детектора кольцо
+        // может быть пустым, и в начало фразы не должен попасть старый звук.
+        if (_preroll != nullptr && _prerollValid > 0) {
+          const size_t first =
+              (_prerollWrite + _prerollFrames - _prerollValid) % _prerollFrames;
+
+          for (size_t frame = 0; frame < _prerollValid; ++frame) {
+            const size_t index = (first + frame) % _prerollFrames;
             if (_onFrame) {
               _onFrame(reinterpret_cast<const uint8_t*>(_preroll + index * AUDIO_FRAME_SAMPLES),
                        AUDIO_FRAME_SAMPLES * sizeof(int16_t));
             }
           }
         }
+
+        _prerollValid = 0;
       } else if (_onLevel) {
         _onLevel(static_cast<uint8_t>(min<uint32_t>(255, levelRms / MIC_LEVEL_DIVISOR)));
       }
@@ -554,6 +603,8 @@ void AudioPipeline::micLoop() {
       _onLevel(static_cast<uint8_t>(min<uint32_t>(255, levelRms / MIC_LEVEL_DIVISOR)));
     }
 
+    ++phraseFrames;
+
     if (rms >= vadOff) {
       silenceFrames = 0;
       ++speechFrames;
@@ -563,8 +614,9 @@ void AudioPipeline::micLoop() {
 
     // Музыка и гул не заканчиваются сами: без верхнего предела фраза не
     // закрывается никогда, детектор «слушает вечно», а новые команды уже не
-    // принимаются. Обрываем затянувшийся фрагмент принудительно.
-    const bool tooLong = speechFrames >= MAX_PHRASE_FRAMES;
+    // принимаются. Обрываем затянувшийся фрагмент принудительно — по полной
+    // длине фразы, чтобы кусок не превысил предел распознавания.
+    const bool tooLong = phraseFrames >= MAX_PHRASE_FRAMES;
 
     if (silenceFrames >= END_SILENCE_FRAMES || tooLong) {
       voiceActive = false;
@@ -624,6 +676,8 @@ void AudioPipeline::startCapture() {
 
 void AudioPipeline::stopCapture() {
   _capturing = false;
+  // Сброс детектора произойдёт в задаче записи: сюда она не должна заглядывать.
+  _flushVad = true;
 }
 
 void AudioPipeline::playPcm(const uint8_t* data, size_t length) {

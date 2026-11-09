@@ -400,11 +400,19 @@ bool PairingCrypto::verifyServerGrant(
     const String& userId,
     const String& pairToken,
     const String& apiBase,
+    uint8_t frameVersion,
     const String& signatureBase64) {
   if (!_ready || deviceId.length() == 0 || challenge.length() != 32
       || userId.length() == 0 || pairToken.length() == 0
       || !apiBase.startsWith("https://") || signatureBase64.length() == 0
       || SPEAKER_PAIRING_PUBLIC_KEY_HEX[0] == '\0') {
+    return false;
+  }
+
+  // Версия кадра входит в подпись: подменить её в эфире нельзя, и сервер не
+  // сможет «откатить» устройство с кодом на версию 1. Значение принимаем
+  // только то, что устройство уже проверило в кадре.
+  if (frameVersion != requiredFrameVersion()) {
     return false;
   }
 
@@ -427,9 +435,9 @@ bool PairingCrypto::verifyServerGrant(
 
   // Нормализация та же, что на сервере: иначе сайт, переформатировавший JSON,
   // сломает проверку подписи. Правило: deviceId — верхний регистр, hex-значения
-  // и GUID — нижний.
+  // и GUID — нижний. Версия кадра — последняя строка канонической строки.
   String canonical;
-  canonical.reserve(230 + deviceId.length() + userId.length()
+  canonical.reserve(245 + deviceId.length() + userId.length()
                     + pairToken.length() + apiBase.length());
   canonical += kGrantDomain;
 
@@ -452,6 +460,8 @@ bool PairingCrypto::verifyServerGrant(
   canonical += pairToken;
   canonical += '\n';
   canonical += apiBase;
+  canonical += '\n';
+  canonical += String(static_cast<unsigned int>(frameVersion));
 
   uint8_t signature[96] = {0};
   size_t signatureLength = 0;
