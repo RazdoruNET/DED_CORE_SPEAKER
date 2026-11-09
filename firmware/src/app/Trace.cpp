@@ -28,9 +28,31 @@ void mark(const char* what) {
 }
 
 void checkHeap() {
+#if !defined(SPEAKER_HEAP_AUDIT)
+  // В рабочей прошивке проверки нет вообще.
+  //
+  // heap_caps_check_integrity_all() обходит весь кучный список без блокировки,
+  // а рядом Wi-Fi, I2S и Bluetooth постоянно что-то выделяют и освобождают.
+  // Обход видит половину обновлённого списка и объявляет живую кучу испорченной;
+  // в логе это `ЦЕЛОСТНОСТЬ НАРУШЕНА` через секунду после подключения к точке,
+  // а на деле — ложное срабатывание, за которым шёл перезапуск платы. Хуже:
+  // сам обход иногда падал на середине (tlsf_check → block_size), и паника
+  // выглядела как повреждение памяти в драйвере Wi-Fi.
+  //
+  // Включать только осознанно, для отладки одного конкретного сценария:
+  // -DSPEAKER_HEAP_AUDIT=1. И тогда — не чаще раза в 2 секунды.
+  return;
+#else
   if (tripped) {
     return;
   }
+
+  static uint32_t lastAuditAt = 0;
+  const uint32_t now = millis();
+  if (now - lastAuditAt < 2000) {
+    return;
+  }
+  lastAuditAt = now;
 
   if (heap_caps_check_integrity_all(false)) {
     return;
@@ -50,6 +72,7 @@ void checkHeap() {
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   delay(200);
   ESP.restart();
+#endif
 }
 
 }  // namespace trace

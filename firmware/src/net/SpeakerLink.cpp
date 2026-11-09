@@ -7,8 +7,6 @@
 #include "app/Beeper.h"
 #include "app/Trace.h"
 
-#include <WiFi.h>
-
 #include "config/AppConfig.h"
 #include "net/DeviceConfig.h"
 #include "net/PublicRoots.h"
@@ -88,6 +86,62 @@ bool splitBase(const String& base, String& host, uint16_t& port, String& path) {
          && host.indexOf('#') < 0;
 }
 
+// Достаёт строковое поле из плоского JSON. Без ArduinoJson: колбэк приёма
+// вызывается в задаче сокета, и выделение памяти там уже приводило к бедам.
+bool jsonField(const char* text, size_t size, const char* marker, char* out, size_t outSize) {
+  const size_t length = strlen(marker);
+  if (outSize == 0) {
+    return false;
+  }
+
+  for (size_t i = 0; i + length <= size; ++i) {
+    if (memcmp(text + i, marker, length) != 0) {
+      continue;
+    }
+
+    size_t written = 0;
+    for (size_t j = i + length; j < size && text[j] != '"' && written + 1 < outSize; ++j) {
+      out[written++] = text[j];
+    }
+    out[written] = '\0';
+    return written > 0;
+  }
+
+  return false;
+}
+
+// Целое поле из плоского JSON: {"kind":"voice","v":123}.
+bool jsonInt(const char* text, size_t size, const char* marker, int& out) {
+  const size_t length = strlen(marker);
+
+  for (size_t i = 0; i + length <= size; ++i) {
+    if (memcmp(text + i, marker, length) != 0) {
+      continue;
+    }
+
+    int value = 0;
+    bool digits = false;
+
+    for (size_t j = i + length; j < size; ++j) {
+      const char symbol = text[j];
+      if (symbol >= '0' && symbol <= '9') {
+        value = value * 10 + (symbol - '0');
+        digits = true;
+      } else {
+        break;
+      }
+    }
+
+    if (digits) {
+      out = value;
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
 bool sendFrame(WebSocketsClient& ws, proto::Type type, uint16_t streamId, uint16_t seq,
                const uint8_t* payload, size_t length) {
   if (length > proto::MAX_PAYLOAD) {
@@ -152,6 +206,8 @@ void SpeakerLink::begin() {
   _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
       case WStype_CONNECTED:
+        _attempts = 0;
+        _ws.setReconnectInterval(WS_RECONNECT_MIN);
         // Приветствие уходит из главного цикла: колбэк вызывается внутри
         // разбора входящих данных, и запись в сокет оттуда ломает состояние
         // TLS-сессии — сервер получал мусор, а куча повреждалась.
@@ -159,12 +215,25 @@ void SpeakerLink::begin() {
         _needHello = true;
         beeper::connected();
         break;
-      case WStype_DISCONNECTED:
+      case WStype_DISCONNECTED: {
         if (_connected) {
           applog::line("[ws] соединение потеряно");
         }
         _connected = false;
+
+        // Повтор с ростом паузы: 2 → 4 → 8 … 30 с. Без этого при недоступном
+        // сервере колонка устраивала рукопожатие TLS каждые две секунды, и
+        // каждое заново выделяло десятки килобайт под сессию.
+        if (_attempts < 8) {
+          ++_attempts;
+        }
+        uint32_t backoff = WS_RECONNECT_MIN << (_attempts > 4 ? 3 : _attempts);
+        if (backoff > WS_RECONNECT_MAX) {
+          backoff = WS_RECONNECT_MAX;
+        }
+        _ws.setReconnectInterval(backoff);
         break;
+      }
       case WStype_TEXT:
         handleText(payload, length);
         break;
@@ -194,6 +263,27 @@ void SpeakerLink::begin() {
   }
 
   _started = true;
+
+  // Сокет живёт в своей задаче. Раньше WebSocketsClient::loop() вызывался из
+  // главного цикла, и рукопожатие TLS (5–7 с) останавливало всё: лента, кнопки
+  // и очередь микрофона ждали, а сторожевой таймер ядра 1 в это время
+  // перезагружал плату (TG1WDT_SYS_RST). Своя задача снимает блокировку и
+  // оставляет главному циклу только звук и индикацию.
+  if (_wsTask == nullptr) {
+    // Стек 8 КБ: внутри рукопожатие mbedTLS и разбор входящих кадров.
+    xTaskCreatePinnedToCore(wsTaskEntry, "ws", 8192, this, 5, &_wsTask, 0);
+  }
+}
+
+void SpeakerLink::wsTaskEntry(void* arg) {
+  static_cast<SpeakerLink*>(arg)->wsLoop();
+}
+
+void SpeakerLink::wsLoop() {
+  for (;;) {
+    pump();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
 }
 
 void SpeakerLink::sendHello() {
@@ -223,6 +313,11 @@ void SpeakerLink::sendHello() {
 }
 
 void SpeakerLink::loop() {
+  // Вся работа с сокетом — в задаче wsLoop: WebSockets не потокобезопасен, и
+  // две задачи не должны трогать клиент одновременно.
+}
+
+void SpeakerLink::pump() {
   if (_started) {
     _ws.loop();
   }
@@ -249,10 +344,15 @@ void SpeakerLink::loop() {
 
       _ws.disconnect();
 
-      if (_resetCount % 2 == 0) {
-        applog::line("[ws] переподключаю Wi-Fi");
-        WiFi.disconnect();
-        WiFi.reconnect();
+      // Wi-Fi на ходу не трогаем. Вызов WiFi.disconnect() под живым TLS-клиентом
+      // уводит драйвер в остановку станции (в бэктрейсе — wi-fi_station_stop →
+      // ieee80211_sta_disconnect) и роняет ядро. Первые попытки — пересоздание
+      // только WebSocket-клиента, дальше честный перезапуск: он не оставляет
+      // полуживое состояние ни в сокете, ни в радио.
+      if (_resetCount >= 3) {
+        applog::line("[ws] соединение не поднимается — перезапуск");
+        delay(100);
+        ESP.restart();
       } else {
         _ws.beginSslWithCA(_host.c_str(), _port, _path.c_str(), trustedRoots().c_str());
       }
@@ -354,6 +454,7 @@ void SpeakerLink::sendVad(bool start, uint32_t rms) {
   String json;
   serializeJson(doc, json);
   postControl(proto::VAD, json.c_str());
+  ++_vadFrames;
 }
 
 void SpeakerLink::sendEvent(const char* kind) {
@@ -417,36 +518,67 @@ void SpeakerLink::handleBinary(const uint8_t* payload, size_t length) {
       break;
     }
     case proto::EVENT: {
-      // Сервер возвращает распознанный текст: пока нет усилителя, это
-      // единственный видимый результат работы «ушей».
       const char* text = reinterpret_cast<const char*>(frame.payload);
       const size_t size = frame.length;
-      const char marker[] = "\"text\":\"";
 
-      for (size_t i = 0; i + sizeof(marker) - 1 <= size; ++i) {
-        if (memcmp(text + i, marker, sizeof(marker) - 1) != 0) {
-          continue;
-        }
+      char kind[24];
+      if (!jsonField(text, size, "\"kind\":\"", kind, sizeof(kind))) {
+        break;
+      }
 
-        String value;
-        value.reserve(160);
-        for (size_t j = i + sizeof(marker) - 1; j < size && text[j] != '"' && value.length() < 160; ++j) {
-          value += text[j];
-        }
-
-        if (value.length() > 0) {
-          applog::printf("[ws] услышала: %s\n", value.c_str());
-          beeper::listening();
+      if (strcmp(kind, "wake") == 0) {
+        // Слово-активатор прозвучало: вот с этого момента колонка и «слушает»
+        // — и лента, и приглушение эфира включаются только здесь.
+        if (_onActivated) {
+          _onActivated();
         }
         break;
+      }
+
+      if (strcmp(kind, "thinking") == 0) {
+        if (_onThinking) {
+          _onThinking();
+        }
+        break;
+      }
+
+      if (strcmp(kind, "voice") == 0) {
+        // Уровень речи агента из браузера: колонка не слышит этот звук, но
+        // рот должен двигаться весь ответ, а не только когда играет сама.
+        int level = 0;
+        int active = 0;
+        jsonInt(text, size, "\"v\":", level);
+        jsonInt(text, size, "\"active\":", active);
+
+        if (_onVoiceLevel) {
+          _onVoiceLevel(static_cast<uint8_t>(constrain(level, 0, 255)), active != 0);
+        }
+        break;
+      }
+
+      char value[160];
+      if (jsonField(text, size, "\"text\":\"", value, sizeof(value))) {
+        applog::printf("[ws] услышала: %s\n", value);
       }
       break;
     }
     case proto::SAY:
     case proto::INTERCOM:
+      ++_sayFrames;
+      _sayBytes += frame.length;
       if (_onAudio) {
         _onAudio(frame.payload, frame.length);
       }
+      break;
+
+    // Сервер отправляет и JSON-кадры бинарным сообщением (у всех кадров общий
+    // шестибайтный заголовок), поэтому SPEECH_BEGIN/END приходят сюда, а не в
+    // handleText. Разбираем их тем же кодом, что и текстовые: handleText сам
+    // отрежет заголовок.
+    case proto::SPEECH_BEGIN:
+    case proto::SPEECH_END:
+    case proto::CMD:
+      handleText(payload, length);
       break;
     default:
       break;

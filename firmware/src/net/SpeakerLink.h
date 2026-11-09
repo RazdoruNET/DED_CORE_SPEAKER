@@ -20,6 +20,9 @@ class SpeakerLink {
   using VoidHandler = std::function<void()>;
 
   void begin();
+
+  /// В главном цикле ничего не делает: сокет живёт в своей задаче (wsLoop).
+  /// Оставлено, чтобы не переписывать вызовы и было видно, что это намеренно.
   void loop();
   void sendHello();
   bool isConnected() const { return _connected; }
@@ -30,6 +33,22 @@ class SpeakerLink {
   void onCommand(CommandHandler handler) { _onCommand = std::move(handler); }
   void onSpeechBegin(SpeechHandler handler) { _onSpeechBegin = std::move(handler); }
   void onSpeechEnd(VoidHandler handler) { _onSpeechEnd = std::move(handler); }
+
+  /// Прозвучало слово-активатор. Приходит с сервера: только он знает, было ли
+  /// обращение, — поэтому колонка не «просыпается» от любого звука в комнате.
+  void onActivated(VoidHandler handler) { _onActivated = std::move(handler); }
+
+  /// Команда принята и ушла помощнику: можно показать «думаю».
+  void onThinking(VoidHandler handler) { _onThinking = std::move(handler); }
+
+  /// Уровень речи агента (0–255). Приходит, когда ответ звучит в браузере:
+  /// колонка этот звук не слышит, но рот должен двигаться.
+  ///
+  /// Второй аргумент — идёт ли речь прямо сейчас. Между слогами уровень падает
+  /// в ноль, но ответ ещё не кончился: по этому флагу колонка не выходит из
+  /// состояния «говорю» до конца фразы.
+  using LevelHandler = std::function<void(uint8_t level, bool active)>;
+  void onVoiceLevel(LevelHandler handler) { _onVoiceLevel = std::move(handler); }
 
   /// Открытый ключ устройства для HELLO. Ставится один раз при старте: по нему
   /// сервер сверяет отпечаток из записи привязки перед выдачей ключа.
@@ -49,19 +68,30 @@ class SpeakerLink {
   // Счётчик отправленных кадров звука: по нему видно, идёт ли поток, когда
   // куча начинает разваливаться.
   uint32_t micFrames() const { return _micFrames; }
+
+  /// Сколько звука пришло от сервера: по этим двум числам видно, доехала ли
+  /// речь агента до колонки, даже если её не слышно.
+  uint32_t vadFrames() const { return _vadFrames; }
+  uint32_t sayFrames() const { return _sayFrames; }
+  uint32_t sayBytes() const { return _sayBytes; }
   void sendVad(bool start, uint32_t rms);
   void sendEvent(const char* kind);
   void sendState(uint32_t freeHeap, int32_t rssi);
 
  private:
+  static void wsTaskEntry(void* arg);
+  void wsLoop();
+  void pump();
   void connect();
   void handleText(const uint8_t* payload, size_t length);
   void handleBinary(const uint8_t* payload, size_t length);
   void handleHelloAck(JsonVariantConst doc);
 
   WebSocketsClient _ws;
-  bool _started = false;
-  bool _connected = false;
+  TaskHandle_t _wsTask = nullptr;
+  volatile bool _started = false;
+  volatile bool _connected = false;
+  uint8_t _attempts = 0;
   String _pendingKey;
   String _publicKeyHex;
   volatile bool _muted = false;
@@ -90,6 +120,9 @@ class SpeakerLink {
   uint16_t _micStream = 1;
   uint16_t _micSeq = 0;
   volatile uint32_t _micFrames = 0;
+  volatile uint32_t _vadFrames = 0;
+  volatile uint32_t _sayFrames = 0;
+  volatile uint32_t _sayBytes = 0;
   uint32_t _lastMicSendAt = 0;
   volatile bool _needHello = false;
 
@@ -97,6 +130,9 @@ class SpeakerLink {
   CommandHandler _onCommand;
   SpeechHandler _onSpeechBegin;
   VoidHandler _onSpeechEnd;
+  VoidHandler _onActivated;
+  VoidHandler _onThinking;
+  LevelHandler _onVoiceLevel;
 };
 
 extern SpeakerLink speakerLink;

@@ -374,6 +374,10 @@ void AudioPipeline::micLoop() {
 
     // Считаем ровно по заполненной части: раньше длина бралась из прочитанного,
     // и при неполном кадре RMS считался по непроинициализированной памяти.
+    //
+    // rms — уровень до AGC. По нему работают детекторы (речь, чих, фон): они
+    // должны видеть сигнал одинаково при любом текущем усилении, иначе
+    // чувствительность «плавала» бы вместе с регулятором.
     const uint32_t rms = rmsOf(pixelBuffer, used);
     _lastRms = rms;
 
@@ -438,28 +442,65 @@ void AudioPipeline::micLoop() {
 
     // Кольцо преролла обновляется всегда, пока идёт тишина: иначе на сервер
     // уходил бы один и тот же застарелый кусок с момента включения.
-    // Оценка шума комнаты: быстро вниз, очень медленно вверх. Фиксированные
-    // пороги не работают — в тихой комнате они ловят шорох, в шумной не
-    // замечают голос.
-    if (!voiceActive) {
-      if (noiseFloor <= 0) {
-        noiseFloor = static_cast<int32_t>(rms);
-      } else {
-        // Вверх — быстро: заиграла музыка, и порог должен подняться за секунду,
-        // иначе колонка будет ловить её как речь. Вниз — тоже быстро, но не
-        // мгновенно: короткие паузы в музыке не должны сбрасывать порог.
-        const int32_t delta = static_cast<int32_t>(rms) - noiseFloor;
-        noiseFloor += delta < 0 ? delta / 16 : delta / 64;
+    //
+    // Оценка фона: минимум в окне 200 мс, сглаженный за пару секунд.
+    //
+    // Простое среднее (как было) в шумной комнате поднимает порог на минуты, и
+    // тихая речь перестаёт проходить. Абсолютный минимум за всё время —
+    // наоборот, слишком оптимистичен: он ловит случайную тишину между шумом
+    // вентилятора, порог падает, и колонка начинает срабатывать на сам шум.
+    // Окно 10 кадров даёт «типичную тишину», а сглаживание убирает дребезг.
+    static uint32_t windowMin = 0xFFFFFFFFu;
+    static uint8_t windowFrames = 0;
+    if (rms < windowMin) {
+      windowMin = rms;
+    }
+    if (++windowFrames >= 10) {
+      // Пока человек говорит, окно не трогаем: его паузы всё равно громче
+      // комнаты, и фон «подполз» бы вверх за одну длинную фразу.
+      if (!voiceActive) {
+        if (noiseFloor <= 0) {
+          noiseFloor = static_cast<int32_t>(windowMin);
+        } else {
+          noiseFloor = static_cast<int32_t>(
+              (static_cast<int32_t>(noiseFloor) * 7 + static_cast<int32_t>(windowMin)) / 8);
+        }
       }
+      windowMin = 0xFFFFFFFFu;
+      windowFrames = 0;
     }
 
     // Запас над шумом должен быть больше, чем разброс шума: днём в комнате
     // уровень гуляет в полтора раза, и меньший запас давал ложные срабатывания
-    // на скрип кресла и стук по столу — распознаватель получал шум и придумывал
-    // «динамичная музыка».
-    const uint32_t vadOn = max<uint32_t>(VAD_RMS_ON, static_cast<uint32_t>(noiseFloor) * 5);
-    const uint32_t vadOff = max<uint32_t>(VAD_RMS_OFF, static_cast<uint32_t>(noiseFloor) * 3);
-    _noiseFloor = static_cast<uint32_t>(noiseFloor);
+    // на скрип кресла и стук по столу. Отсюда 2.4× на включение и 1.8× на
+    // выключение — порог адаптивный, но заметно ниже прежних 5× и 3×.
+    const uint32_t noise = static_cast<uint32_t>(noiseFloor > 0 ? noiseFloor : 0);
+    const uint32_t vadOn = max<uint32_t>(VAD_RMS_ON, noise * VAD_NOISE_ON_X10 / 10);
+    const uint32_t vadOff = max<uint32_t>(VAD_RMS_OFF, noise * VAD_NOISE_OFF_X10 / 10);
+    _noiseFloor = noise;
+
+    // AGC: тихую речь поднимаем к целевому уровню, громкую не трогаем.
+    // Включается только когда сигнал явно выше фона, поэтому тишина и шум
+    // остаются тихими, а пороги VAD (они считаются по сигналу до AGC) не
+    // зависят от текущего усиления.
+    static float agcBoost = 1.0f;
+    float targetBoost = 1.0f;
+    if (rms >= MIC_AGC_MIN_RMS && rms > noise * MIC_AGC_NOISE_X) {
+      targetBoost = constrain(MIC_AGC_TARGET / static_cast<float>(rms), 1.0f, MIC_AGC_MAX_BOOST);
+    }
+    agcBoost += (targetBoost - agcBoost) * (targetBoost > agcBoost ? 0.35f : 0.05f);
+
+    if (agcBoost > 1.02f) {
+      for (size_t i = 0; i < used; ++i) {
+        pixelBuffer[i] = clampToInt16(
+            static_cast<int32_t>(static_cast<float>(pixelBuffer[i]) * agcBoost));
+      }
+    }
+
+    // Уровень для анимации рта считается уже после AGC: рот должен открываться
+    // и на тихой фразе, иначе кажется, что колонка не слушает.
+    const uint32_t levelRms = rmsOf(pixelBuffer, used);
+    _lastRms = levelRms;
 
     if (!voiceActive && _preroll != nullptr && _prerollFrames > 0) {
       memcpy(_preroll + _prerollWrite * AUDIO_FRAME_SAMPLES, pixelBuffer,
@@ -469,7 +510,7 @@ void AudioPipeline::micLoop() {
 
     if (!_capturing) {
       if (_onLevel) {
-        _onLevel(static_cast<uint8_t>(min<uint32_t>(255, rms / 32)));
+        _onLevel(static_cast<uint8_t>(min<uint32_t>(255, levelRms / MIC_LEVEL_DIVISOR)));
       }
       continue;
     }
@@ -493,7 +534,7 @@ void AudioPipeline::micLoop() {
           }
         }
       } else if (_onLevel) {
-        _onLevel(static_cast<uint8_t>(min<uint32_t>(255, rms / 32)));
+        _onLevel(static_cast<uint8_t>(min<uint32_t>(255, levelRms / MIC_LEVEL_DIVISOR)));
       }
     }
 
@@ -505,6 +546,12 @@ void AudioPipeline::micLoop() {
       trace::mark("mic.frame->net");
       _onFrame(reinterpret_cast<const uint8_t*>(pixelBuffer),
                AUDIO_FRAME_SAMPLES * sizeof(int16_t));
+    }
+
+    // Уровень обновляется и во время фразы: иначе рот замирал бы на первом
+    // кадре и речь выглядела как ровное свечение.
+    if (_onLevel) {
+      _onLevel(static_cast<uint8_t>(min<uint32_t>(255, levelRms / MIC_LEVEL_DIVISOR)));
     }
 
     if (rms >= vadOff) {
@@ -539,8 +586,11 @@ void AudioPipeline::playerLoop() {
   int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
 
   for (;;) {
-    if (playbackQueue == nullptr || xQueueReceive(playbackQueue, &chunk, portMAX_DELAY) != pdTRUE) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+    // Ждём с таймаутом, а не вечно: когда речи нет, уровень должен упасть до
+    // нуля, иначе рот останется открытым на последнем слоге.
+    if (playbackQueue == nullptr
+        || xQueueReceive(playbackQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+      _outputLevel = 0;
       continue;
     }
 
@@ -555,6 +605,13 @@ void AudioPipeline::playerLoop() {
     size_t written = 0;
     i2s_write(kSpeakerPort, stereo, chunk.count * 2 * sizeof(int16_t), &written,
               pdMS_TO_TICKS(200));
+
+    // Уровень отданного звука — для анимации рта агента. Считаем по тому, что
+    // реально ушло в усилитель: громкость уже применена, и рот открывается
+    // ровно настолько, насколько громко звучит речь.
+    const uint32_t level = rmsOf(chunk.samples, chunk.count);
+    _outputLevel = static_cast<uint8_t>(
+        min<uint32_t>(255, level / SPEAKER_VOICE_LEVEL_DIVISOR));
   }
 }
 
@@ -593,6 +650,8 @@ void AudioPipeline::flushPlayback() {
   if (playbackQueue != nullptr) {
     xQueueReset(playbackQueue);
   }
+
+  _outputLevel = 0;
 }
 
 void AudioPipeline::setVolume(uint8_t value) {

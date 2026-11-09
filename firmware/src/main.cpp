@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 #include "app/Beeper.h"
 #include "app/Intents.h"
@@ -24,6 +25,19 @@ uint32_t lastCapturedFrames = 0;
 // Строгая сборка запустилась на плате без flash-шифрования. Тогда ничего не
 // делаем: иначе ключ устройства и пароль Wi-Fi легли бы в NVS открытым текстом.
 bool securityBlocked = false;
+
+// Пока колонка говорит, микрофон не пишет: иначе она слышит саму себя,
+// отправляет собственную речь на распознавание и «разговаривает с собой».
+bool agentSpeaking = false;
+
+// Уровень речи агента, который приходит с сервера: так рот двигается и тогда,
+// когда ответ звучит в браузере, а не в динамике колонки.
+volatile uint8_t serverVoiceLevel = 0;
+uint32_t lastServerVoiceAt = 0;
+bool serverVoiceActive = false;
+
+// Синий для вспышки «услышала обращение» — тот же, что в палитре Ui.
+constexpr uint32_t kUiBlue = (30u << 16) | (80u << 8) | 240u;
 
 constexpr uint32_t kStateIntervalMs = 10000;
 constexpr uint32_t kHeapLogIntervalMs = 5000;
@@ -63,8 +77,12 @@ void beginSession() {
 
 // Физический переключатель микрофона. На профиле DA это GPIO36: вывод только
 // на вход и без внутренней подтяжки, поэтому на плате обязателен внешний
-// резистор вверх. Три одинаковых отсчёта с шагом 20 мс отсекают дребезг и
-// наводки — иначе плавающий вход мог бы «выключить» микрофон сам.
+// резистор вверх.
+//
+// Отсечка помех длиной 160 мс: восемь одинаковых отсчётов с шагом 20 мс.
+// Прежние три (60 мс) пропускали короткие наводки, и красная лента «mute»
+// мигала на долю секунды посреди обычной работы — со стороны это выглядело как
+// случайные красные вспышки.
 bool muteSwitchClosed() {
   static bool stable = false;
   static bool candidate = false;
@@ -80,7 +98,7 @@ bool muteSwitchClosed() {
   const bool sampled = digitalRead(pins::SW_MUTE) == LOW;
 
   if (sampled == candidate) {
-    if (sameCount < 3) {
+    if (sameCount < 8) {
       ++sameCount;
     }
   } else {
@@ -88,7 +106,7 @@ bool muteSwitchClosed() {
     sameCount = 1;
   }
 
-  if (sameCount >= 3) {
+  if (sameCount >= 8) {
     stable = candidate;
   }
 
@@ -124,22 +142,65 @@ bool syncMute() {
   return muted;
 }
 
+// Уровень микрофона для шкалы — по логарифму, а не линейно.
+//
+// Громкость человек слышит логарифмически: разговор с метра и крик в упор
+// различаются по RMS в десятки раз, а на слух — втрое. При линейной шкале
+// обычная речь занимала одно деление из восьми, а всё остальное упиралось в
+// максимум. Логарифм растягивает тихую часть: шёпот — одно деление, разговор —
+// половина шкалы, громкий голос — вся шкала.
+uint8_t micLevel(uint32_t rms) {
+  // 50 — шум комнаты и шёпот, 3000 — речь в упор.
+  constexpr float kFloor = 50.0f;
+  constexpr float kCeil = 3000.0f;
+
+  if (rms <= static_cast<uint32_t>(kFloor)) {
+    return 0;
+  }
+
+  const float ratio = logf(static_cast<float>(rms) / kFloor) / logf(kCeil / kFloor);
+  return static_cast<uint8_t>(constrain(static_cast<int>(ratio * 255.0f), 0, 255));
+}
+
 void wireAudio() {
   audioPipeline.onFrame([](const uint8_t* pcm, size_t length) {
     speakerLink.sendMic(pcm, length);
   });
 
   audioPipeline.onVad([](bool start, uint32_t rms) {
-#if defined(SPEAKER_MIC_DIAG)
+    // Границы фраз печатаем всегда: по ним видно, доходит ли до сервера
+    // сигнал «фраза закончилась» — без него распознавание просто не начнётся.
     applog::printf("[vad] %s, rms %u\n", start ? "начало речи" : "конец речи", rms);
-#endif
+    // Состояние здесь НЕ меняем. Колонка слышит комнату постоянно, и раньше
+    // она «просыпалась» на любой звук: кашель, посуду, разговор не с ней.
+    // Активация — только по слову-активатору, а его знает сервер (см.
+    // onActivated). Звук всё равно уходит на распознавание: иначе сервер не
+    // поймёт, что обращение было.
     speakerLink.sendVad(start, rms);
-    if (start) {
-      // Короткий сигнал «услышала»: без усилителя это единственный отклик.
-      beeper::listening();
-      ui.setState(AgentState::Listening);
-    } else {
-      ui.setState(AgentState::Thinking);
+  });
+
+  // Слово-активатор распознано: вот теперь колонка показывает «слушаю».
+  speakerLink.onActivated([]() {
+    applog::line("[voice] слово-активатор распознано — слушаю");
+    beeper::listening();
+    // Вспышка всей ленты синим на две секунды: обращение услышано.
+    ui.flash(kUiBlue, 2000);
+    ui.setState(AgentState::Listening);
+  });
+
+  // Команда принята и ушла помощнику: «думаю».
+  speakerLink.onThinking([]() {
+    ui.setState(AgentState::Thinking);
+  });
+
+  // Ответ агента звучит в браузере: рисуем его речь по уровню с сервера.
+  speakerLink.onVoiceLevel([](uint8_t level, bool active) {
+    serverVoiceLevel = level;
+    serverVoiceActive = active;
+    lastServerVoiceAt = millis();
+
+    if (active && ui.state() != AgentState::Speaking) {
+      ui.setState(AgentState::Speaking);
     }
   });
 
@@ -149,20 +210,31 @@ void wireAudio() {
   });
 
   audioPipeline.onLevel([](uint8_t level) {
-    if (ui.state() == AgentState::Listening) {
-      ui.setLevel(level);
-    }
+    // Микрофон двигает только шкалы: рот повторяет голос агента, а не человека.
+    ui.setHearingLevel(level);
   });
 
   speakerLink.onAudio([](const uint8_t* data, size_t length) {
     audioPipeline.playPcm(data, length);
   });
 
-  speakerLink.onSpeechBegin([](uint16_t, const String&) {
+  speakerLink.onSpeechBegin([](uint16_t streamId, const String& text) {
+    // Лог важен не для красоты: по нему видно, доехала ли речь агента до
+    // колонки. Если строка не появляется, значит сервер молчит, а не лента.
+    applog::printf("[voice] агент говорит (поток %u, «%s»)\n",
+                   static_cast<unsigned>(streamId), text.c_str());
+    agentSpeaking = true;
+    if (audioPipeline.isCapturing()) {
+      audioPipeline.stopCapture();
+    }
     ui.setState(AgentState::Speaking);
   });
 
   speakerLink.onSpeechEnd([]() {
+    applog::printf("[voice] агент закончил: кадров %u, байт %u\n",
+                   static_cast<unsigned>(speakerLink.sayFrames()),
+                   static_cast<unsigned>(speakerLink.sayBytes()));
+    agentSpeaking = false;
     ui.setState(speakerLink.isConnected() ? AgentState::Idle : AgentState::Offline);
   });
 
@@ -201,8 +273,36 @@ void wireAudio() {
 void setup() {
   applog::begin();
   delay(300);
-  applog::printf("\n=== DED CORE SPEAKER %s (%s) ===\n", SPEAKER_FIRMWARE_VERSION,
-                SPEAKER_PROFILE_NAME);
+  applog::printf("\n=== DED CORE SPEAKER %s (%s), LED %u/255 ===\n",
+                SPEAKER_FIRMWARE_VERSION, SPEAKER_PROFILE_NAME,
+                static_cast<unsigned>(LED_BRIGHTNESS_MAX));
+
+#if defined(SPEAKER_LED_ONLY_TEST)
+  // Только лента: без микрофона, Wi-Fi и TLS. Так проверка пайки не зависит
+  // от состояния сети и не перезагружается вместе с ней.
+  ui.begin();
+  ui.setState(AgentState::Boot);
+  return;
+#endif
+
+  // TLS-рукопожатие с сервером занимает 5–7 с, и всё это время главный цикл
+  // стоит внутри WebSocketsClient::loop(). Штатный сторожевой таймер IDLE-задачи
+  // ядра 1 (5 с) в это время считает, что система зависла, и перезагружает
+  // колонку — в логе это `TG1WDT_SYS_RST` сразу после подключения к точке.
+  //
+  // Свой сторож остаётся и работает по существу: если связи нет дольше
+  // WATCHDOG_REBOOT_MS, колонка перезапускается сама (см. loop). Он ловит именно
+  // «зависла и молчит», а не «долго устанавливает защищённое соединение».
+  //
+  // Таймаут меняется только через снятие и повторную установку: штатные 5 с срабатывают на
+  // TLS-рукопожатии: оно блокирует главный цикл, колонка перезагружается прямо
+  // на подключении (в логе `TG1WDT_SYS_RST` сразу после «подключаюсь»).
+  {
+    const esp_err_t stopped = esp_task_wdt_deinit();
+    const esp_err_t started = esp_task_wdt_init(30, true);
+    applog::printf("[boot] сторожевой таймер: снят %d, включён на 30 с %d\n",
+                   static_cast<int>(stopped), static_cast<int>(started));
+  }
 
   securityBlocked = !speakerSecureFlashEnabled();
 
@@ -279,6 +379,12 @@ void setup() {
 }
 
 void loop() {
+#if defined(SPEAKER_LED_ONLY_TEST)
+  ui.tick();
+  delay(5);
+  return;
+#endif
+
   beeper::tick();
 
   // Строгая сборка без flash-шифрования: только лента с ошибкой, никакой сети,
@@ -303,7 +409,49 @@ void loop() {
   }
 #endif
 
+  // Страховка от застывшей ленты: «слушаю»/«думаю» живут, пока сервер не
+  // пришлёт следующий шаг. Если ответ потерялся (обрыв, ошибка помощника),
+  // через 45 секунд возвращаемся в простой.
+  {
+    static uint32_t waitingSince = 0;
+    if (ui.state() == AgentState::Listening || ui.state() == AgentState::Thinking) {
+      if (waitingSince == 0) {
+        waitingSince = millis();
+      } else if (millis() - waitingSince > 45000) {
+        waitingSince = 0;
+        ui.setState(AgentState::Idle);
+      }
+    } else {
+      waitingSince = 0;
+    }
+  }
+
   trace::checkHeap();
+
+  // Рот повторяет голос агента: уровень берём из воспроизводимого звука, а не
+  // с микрофона. Микрофон в этот момент слышит динамик, и рот дёргался бы от
+  // эха и от чужих голосов в комнате.
+  const uint8_t playbackLevel = audioPipeline.outputLevel();
+
+  // Уровень с сервера не должен «залипнуть», если ответ оборвался.
+  if (millis() - lastServerVoiceAt > 800) {
+    serverVoiceLevel = 0;
+    serverVoiceActive = false;
+  }
+
+  ui.setVoiceLevel(playbackLevel > serverVoiceLevel ? playbackLevel : serverVoiceLevel);
+
+  // Шкалы микрофонов: правый канал растёт от диода 1 к центру, левый — от
+  // диода 17.
+  ui.setMicLevels(micLevel(audioPipeline.rmsLeft()), micLevel(audioPipeline.rmsRight()));
+
+  // Рот говорит, пока идёт звук — из динамика или из браузера. Когда звук
+  // кончился и сервер молчит, возвращаемся в простой.
+  if (ui.state() == AgentState::Speaking && playbackLevel == 0 && serverVoiceLevel == 0
+      && !agentSpeaking && !serverVoiceActive && millis() - lastServerVoiceAt > 1200) {
+    ui.setState(speakerLink.isConnected() ? AgentState::Idle : AgentState::Offline);
+  }
+
   ui.tick();
   intents.tick();
   wifiLink.loop();
@@ -368,7 +516,7 @@ void loop() {
   // кнопки, которой на макете физически нет.
   const bool muted = syncMute();
 
-  if (speakerLink.isConnected() && !muted && !audioPipeline.isCapturing()) {
+  if (speakerLink.isConnected() && !muted && !agentSpeaking && !audioPipeline.isCapturing()) {
     audioPipeline.startCapture();
   }
 
@@ -376,7 +524,6 @@ void loop() {
     const uint32_t now = millis();
     if (now - lastHeapLogAt >= kHeapLogIntervalMs) {
       lastHeapLogAt = now;
-      const bool heapOk = heap_caps_check_integrity_all(true);
       const uint32_t frames = audioPipeline.framesCaptured();
       const uint32_t fps = (frames - lastCapturedFrames) * 1000 / kHeapLogIntervalMs;
       lastCapturedFrames = frames;
@@ -384,12 +531,20 @@ void loop() {
       uint32_t burstZcr = 0;
       audioPipeline.takeBurstPeaks(burstRms, burstZcr);
 
-      applog::printf("[heap] %u внутр, кадров %u, темп %u/с, шум %u, rms %u, пик %u, zcr %u, куча %s\n",
+      // Порог печатается рядом с фоном: по этим двум числам видно, почему
+      // колонка не слышит тихую фразу — порог выше речи или ниже.
+      const uint32_t threshold = max<uint32_t>(
+          VAD_RMS_ON, audioPipeline.noiseFloor() * VAD_NOISE_ON_X10 / 10);
+
+      applog::printf("[heap] %u внутр, кадров %u, vad %u, темп %u/с, шум %u, порог %u, rms %u, пик %u, zcr %u, речь %u/%u\n",
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)speakerLink.micFrames(), (unsigned)fps,
-                     (unsigned)audioPipeline.noiseFloor(), (unsigned)audioPipeline.rms(),
+                     (unsigned)speakerLink.micFrames(),
+                     (unsigned)speakerLink.vadFrames(), (unsigned)fps,
+                     (unsigned)audioPipeline.noiseFloor(), (unsigned)threshold,
+                     (unsigned)audioPipeline.rms(),
                      (unsigned)burstRms, (unsigned)burstZcr,
-                     heapOk ? "цела" : "ПОВРЕЖДЕНА");
+                     (unsigned)speakerLink.sayFrames(),
+                     (unsigned)speakerLink.sayBytes());
     }
     if (now - lastStateAt >= kStateIntervalMs) {
       lastStateAt = now;

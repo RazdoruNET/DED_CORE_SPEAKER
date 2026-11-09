@@ -58,6 +58,10 @@ class AudioPipeline {
   uint32_t rmsLeft() const { return _lastRmsLeft; }
   uint32_t rmsRight() const { return _lastRmsRight; }
 
+  /// Уровень воспроизводимого звука (0–255). По нему двигается рот, когда
+  /// говорит агент: микрофон в этот момент слышит динамик, а не человека.
+  uint8_t outputLevel() const { return _outputLevel; }
+
   // Пиковые значения с момента прошлого вызова. Пик важнее среднего: по нему
   // видно, упирается ли тракт в предел, то есть не сдвинуты ли биты.
   void takePeaks(uint32_t& left, uint32_t& right) {
@@ -93,6 +97,7 @@ class AudioPipeline {
   uint32_t _lastRmsRight = 0;
   volatile uint32_t _framesCaptured = 0;
   volatile uint32_t _noiseFloor = 0;
+  volatile uint8_t _outputLevel = 0;
   volatile uint32_t _peakLeft = 0;
   volatile uint32_t _peakRight = 0;
 

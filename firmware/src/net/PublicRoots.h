@@ -19,4 +19,4 @@
 "zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW\n" \
 "tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1\n" \
 "/q4AaOeMSQ+2b1tbFfLn\n" \
-"-----END CERTIFICATE-----\n" \
+"-----END CERTIFICATE-----\n"
