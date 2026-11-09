@@ -3,6 +3,7 @@
 
 #include "app/Beeper.h"
 #include "app/Intents.h"
+#include "app/Role.h"
 #include "app/Trace.h"
 #include "app/Ui.h"
 #include "audio/AudioPipeline.h"
@@ -171,6 +172,24 @@ void wireAudio() {
     // Границы фраз печатаем всегда: по ним видно, доходит ли до сервера
     // сигнал «фраза закончилась» — без него распознавание просто не начнётся.
     applog::printf("[vad] %s, rms %u\n", start ? "начало речи" : "конец речи", rms);
+
+    // Повторный колбэк «конец речи» на ту же фразу не должен плодить строки.
+    static bool offlinePhraseReported = false;
+
+    if (!speakerLink.isConnected() && kRole == DeviceRole::Home) {
+      // Офлайн-ветка: распознавателя в прошивке ещё нет, поэтому фразу только
+      // отмечаем в логе и на сервер ничего не шлём. Следующий этап подключит
+      // сюда акустический распознаватель: таблица фраз уже готова
+      // (app/LocalCommands.h), останется провести LocalAction → intents.
+      if (start) {
+        offlinePhraseReported = false;
+      } else if (!offlinePhraseReported) {
+        offlinePhraseReported = true;
+        applog::line("[local] офлайн-фраза: распознавание не подключено");
+      }
+      return;
+    }
+
     // Состояние здесь НЕ меняем. Колонка слышит комнату постоянно, и раньше
     // она «просыпалась» на любой звук: кашель, посуду, разговор не с ней.
     // Активация — только по слову-активатору, а его знает сервер (см.
@@ -511,12 +530,14 @@ void loop() {
     speakerLink.begin();
   }
 
-  // Уши включены, пока есть связь и микрофон не выключен: детектор речи сам
-  // решает, когда отправлять реплику. Без этого колонка молчала бы до нажатия
-  // кнопки, которой на макете физически нет.
+  // Уши включены, пока микрофон не выключен: детектор речи сам решает, когда
+  // отправлять реплику. Домашняя колонка слушает и без сервера — иначе
+  // встроенные команды не работали бы в офлайне. Без этого колонка молчала бы
+  // до нажатия кнопки, которой на макете физически нет.
   const bool muted = syncMute();
 
-  if (speakerLink.isConnected() && !muted && !agentSpeaking && !audioPipeline.isCapturing()) {
+  if ((speakerLink.isConnected() || (kRole == DeviceRole::Home && deviceConfig.isPaired()))
+      && !muted && !agentSpeaking && !audioPipeline.isCapturing()) {
     audioPipeline.startCapture();
   }
 

@@ -16,6 +16,10 @@ class Intents {
   void volumeDown();
   void toggleMute();
 
+  // Свет пока заглушка: лог, короткий сигнал и событие серверу, без GPIO и ИК.
+  void lightOn();
+  void lightOff();
+
  private:
   void chime(uint16_t frequency, uint16_t durationMs);
 

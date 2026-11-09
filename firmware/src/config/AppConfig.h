@@ -41,7 +41,7 @@ inline bool speakerSecureFlashEnabled() { return true; }
 // ---------------------------------------------------------------------------
 // Идентификация устройства и версия
 // ---------------------------------------------------------------------------
-#define SPEAKER_FIRMWARE_VERSION "0.1.0"
+#define SPEAKER_FIRMWARE_VERSION "0.2.0"
 #define SPEAKER_PRODUCT          "smart-speaker"
 
 #if defined(DEVICE_PROFILE_S3)

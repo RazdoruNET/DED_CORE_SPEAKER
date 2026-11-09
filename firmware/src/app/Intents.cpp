@@ -1,6 +1,8 @@
 #include "app/Intents.h"
 
+#include "app/Beeper.h"
 #include "app/Ui.h"
+#include "config/AppConfig.h"
 
 #include "audio/AudioPipeline.h"
 #include "net/DeviceConfig.h"
@@ -11,6 +13,11 @@ Intents intents;
 namespace {
 constexpr uint16_t kToneSamples = 1600;  // 100 мс при 16 кГц
 int16_t toneBuffer[kToneSamples];
+
+// Короткие подтверждения света: тише и короче мелодий привязки, чтобы не
+// перебивать разговор.
+constexpr beeper::Note kLightOnNotes[] = {{1760, 70}, {2093, 90}};
+constexpr beeper::Note kLightOffNotes[] = {{1568, 70}, {1046, 90}};
 }  // namespace
 
 void Intents::begin() {
@@ -63,6 +70,23 @@ void Intents::toggleMute() {
   ui.setMuted(deviceConfig.muted);
   deviceConfig.saveVolume();
   speakerLink.sendEvent(deviceConfig.muted ? "muted" : "unmuted");
+}
+
+void Intents::lightOn() {
+  applog::line("[local] свет включён");
+  // Пищалка подтверждает команду; при SPEAKER_BEEPER_SILENT beeper::play молчит.
+  beeper::play(kLightOnNotes, sizeof(kLightOnNotes) / sizeof(kLightOnNotes[0]));
+  if (speakerLink.isConnected()) {
+    speakerLink.sendEvent("local.light.on");
+  }
+}
+
+void Intents::lightOff() {
+  applog::line("[local] свет выключен");
+  beeper::play(kLightOffNotes, sizeof(kLightOffNotes) / sizeof(kLightOffNotes[0]));
+  if (speakerLink.isConnected()) {
+    speakerLink.sendEvent("local.light.off");
+  }
 }
 
 void Intents::chime(uint16_t frequency, uint16_t durationMs) {
