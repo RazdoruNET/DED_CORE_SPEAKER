@@ -306,6 +306,13 @@ pio device monitor -b 115200
 * Речь агента по `SAY`.
 * Лента состояний.
 
+## Поддержка
+
+- [Сайт платформы — dedbox.pro](https://dedbox.pro)
+- [Группа ВКонтакте](https://vk.com/ded_moto_sys)
+- [Группа Telegram](https://t.me/DED_MOTO_SYSTEM)
+- [Курилка Telegram](https://t.me/+kN1d2EnrmdkyYmFi)
+
 ## Лицензия
 
 Прошивка, документация и описания протоколов распространяются по
