@@ -30,6 +30,9 @@ class SpeakerLink {
   bool isLinkUp() const { return _started; }
 
   void onAudio(AudioHandler handler) { _onAudio = std::move(handler); }
+
+  /// Кусок трека в MP3 от сервера: устройство декодирует его само.
+  void onMedia(AudioHandler handler) { _onMedia = std::move(handler); }
   void onCommand(CommandHandler handler) { _onCommand = std::move(handler); }
   void onSpeechBegin(SpeechHandler handler) { _onSpeechBegin = std::move(handler); }
   void onSpeechEnd(VoidHandler handler) { _onSpeechEnd = std::move(handler); }
@@ -127,6 +130,7 @@ class SpeakerLink {
   volatile bool _needHello = false;
 
   AudioHandler _onAudio;
+  AudioHandler _onMedia;
   CommandHandler _onCommand;
   SpeechHandler _onSpeechBegin;
   VoidHandler _onSpeechEnd;

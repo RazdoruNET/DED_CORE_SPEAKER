@@ -242,6 +242,11 @@ void BlePairing::tick() {
 }
 
 void BlePairing::report(const String& stage, bool ok, const String& error) {
+  // Стадии видны и в порту: окно привязки живёт пять минут, а человек в это
+  // время смотрит в браузер — без строки в логе причина отказа теряется.
+  applog::printf("[ble] стадия %s, ok=%u%s%s\n", stage.c_str(), ok ? 1u : 0u,
+                 error.length() > 0 ? ", ошибка " : "", error.c_str());
+
   if (statusCharacteristic == nullptr) {
     return;
   }

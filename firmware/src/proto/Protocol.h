@@ -26,6 +26,7 @@ enum Type : uint8_t {
   CMD           = 0x0A,
   CODEC         = 0x0B,
   INTERCOM      = 0x0C,
+  MEDIA         = 0x0D,
 };
 
 enum Flags : uint8_t {

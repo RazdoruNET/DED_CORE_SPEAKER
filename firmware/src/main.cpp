@@ -7,6 +7,7 @@
 #include "app/Trace.h"
 #include "app/Ui.h"
 #include "audio/AudioPipeline.h"
+#include "media/MediaPlayer.h"
 #include "config/AppConfig.h"
 #include "net/BlePairing.h"
 #include "net/DeviceConfig.h"
@@ -30,6 +31,26 @@ bool securityBlocked = false;
 // Пока колонка говорит, микрофон не пишет: иначе она слышит саму себя,
 // отправляет собственную речь на распознавание и «разговаривает с собой».
 bool agentSpeaking = false;
+
+// Когда последний раз приходил звук речи агента. Нужен, чтобы «говорю» не
+// залипло навсегда, если SPEECH_END потерялся: иначе колонка замолкает и
+// перестаёт слушать до перезагрузки.
+uint32_t lastAgentAudioAt = 0;
+
+// Эфир, который попросили включить, пока колонка ещё говорила или пока сервер
+// разбирал реплику. Запускать его в этот момент нельзя: порт I2S занят речью, а
+// разбор ответа уже занял память, и на буферы эфира её не остаётся — в логе это
+// «мало памяти под эфир: 45 КБ». Запускаем, когда речь кончилась и куча
+// освободилась, но не позже MEDIA_PENDING_TIMEOUT_MS.
+String pendingMediaUrl;
+String pendingMediaTitle;
+uint32_t pendingMediaSince = 0;
+
+constexpr uint32_t MEDIA_PENDING_TIMEOUT_MS = 15000;
+
+// Сколько свободной кучи нужно, чтобы эфир запустился наверняка. Замерено по
+// логу: буферы и две задачи просят около 54 КБ, ещё немного уходит на сокет.
+constexpr uint32_t MEDIA_READY_HEAP = 52000;
 
 // Уровень речи агента, который приходит с сервера: так рот двигается и тогда,
 // когда ответ звучит в браузере, а не в динамике колонки.
@@ -163,6 +184,34 @@ uint8_t micLevel(uint32_t rms) {
   return static_cast<uint8_t>(constrain(static_cast<int>(ratio * 255.0f), 0, 255));
 }
 
+#if defined(SPEAKER_RADIO_DNS_TEST)
+// Диагностика DNS: какие имена колонка разбирает и каким сервером. Нужна,
+// когда станция «не отвечает» на адресе, который открывается с компьютера.
+void radioDnsProbe() {
+  static uint32_t lastProbe = 0;
+
+  if (millis() - lastProbe < 10000) {
+    return;
+  }
+
+  lastProbe = millis();
+
+  const char* hosts[] = {"dedbox.pro", "ep128.hostingradio.ru", "rusradio.hostingradio.ru",
+                         "retro.hostingradio.ru", "online.radiorecord.ru", "yandex.ru"};
+
+  applog::printf("[dns] wifi %d, сервер %s\n", static_cast<int>(WiFi.status()),
+                 WiFi.dnsIP().toString().c_str());
+
+  for (const char* host : hosts) {
+    IPAddress ip;
+    const uint32_t started = millis();
+    const bool ok = WiFi.hostByName(host, ip);
+    applog::printf("[dns] %s %s %s (%u мс)\n", host, ok ? "ок" : "НЕТ", ip.toString().c_str(),
+                   static_cast<unsigned>(millis() - started));
+  }
+}
+#endif
+
 void wireAudio() {
   audioPipeline.onFrame([](const uint8_t* pcm, size_t length) {
     speakerLink.sendMic(pcm, length);
@@ -234,7 +283,14 @@ void wireAudio() {
   });
 
   speakerLink.onAudio([](const uint8_t* data, size_t length) {
+    lastAgentAudioAt = millis();
     audioPipeline.playPcm(data, length);
+  });
+
+  // Сервер присылает трек кусками MP3: устройство декодирует само. Так играет
+  // «моя музыка» любого формата — M4A и AAC плата не разберёт без сервера.
+  speakerLink.onMedia([](const uint8_t* data, size_t length) {
+    media::feed(data, length);
   });
 
   speakerLink.onSpeechBegin([](uint16_t streamId, const String& text) {
@@ -242,7 +298,11 @@ void wireAudio() {
     // колонки. Если строка не появляется, значит сервер молчит, а не лента.
     applog::printf("[voice] агент говорит (поток %u, «%s»)\n",
                    static_cast<unsigned>(streamId), text.c_str());
+    // Речь важнее эфира: порт I2S один, и говорить поверх музыки некуда.
+    // Эфир вернётся сам после SPEECH_END (живой — переподключением).
+    media::pauseForSpeech();
     agentSpeaking = true;
+    lastAgentAudioAt = millis();
     if (audioPipeline.isCapturing()) {
       audioPipeline.stopCapture();
     }
@@ -255,9 +315,14 @@ void wireAudio() {
                    static_cast<unsigned>(speakerLink.sayBytes()));
     agentSpeaking = false;
     ui.setState(speakerLink.isConnected() ? AgentState::Idle : AgentState::Offline);
+    media::resumeAfterSpeech();
   });
 
   speakerLink.onCommand([](const String& action, JsonVariantConst args) {
+    // Команды печатаем всегда: без этого не видно, дошла ли до платы команда
+    // сервера или колонка просто ничего не получила.
+    applog::printf("[cmd] %s\n", action.c_str());
+
     if (action == "volume") {
       const int value = args["value"] | deviceConfig.volume;
       deviceConfig.volume = static_cast<uint8_t>(constrain(value, 0, 100));
@@ -276,6 +341,37 @@ void wireAudio() {
       ui.setState(AgentState::Incoming);
     } else if (action == "stop") {
       audioPipeline.flushPlayback();
+      media::pauseForSpeech();
+      ui.setState(AgentState::Idle);
+    } else if (action == "media.play") {
+      // Эфир и треки колонка тянет сама: через сервер шёл бы PCM 16 кГц, то
+      // есть «телефон» вместо музыки.
+      const String url = args["url"] | "";
+      const String title = args["title"] | "";
+      applog::printf("[media] команда: «%s» %s\n", title.c_str(), url.c_str());
+      if (url.length() == 0) {
+        applog::line("[media] команда без ссылки — играть нечего");
+      } else if (agentSpeaking || ESP.getFreeHeap() < MEDIA_READY_HEAP) {
+        pendingMediaUrl = url;
+        pendingMediaTitle = title;
+        pendingMediaSince = millis();
+        applog::printf("[media] отложен до конца речи: «%s», свободно %u\n", title.c_str(),
+                       static_cast<unsigned>(ESP.getFreeHeap()));
+      } else if (!media::play(url, title)) {
+        applog::line("[media] не удалось начать поток");
+      } else {
+        ui.setState(AgentState::Speaking);
+      }
+    } else if (action == "media.stream") {
+      // Трек перекодирует сервер и присылает кадрами MEDIA.
+      const String title = args["title"] | "";
+      applog::printf("[media] поток от сервера: «%s»\n", title.c_str());
+      media::beginRelay(title);
+      ui.setState(AgentState::Speaking);
+    } else if (action == "media.stop") {
+      pendingMediaUrl = "";
+      pendingMediaTitle = "";
+      media::stop();
       ui.setState(AgentState::Idle);
     } else if (action == "intercom.start") {
       ui.setState(AgentState::Intercom);
@@ -335,6 +431,16 @@ void setup() {
 
   audioPipeline.begin();
   audioPipeline.setVolume(deviceConfig.volume);
+
+  // Память под эфир берём до Wi-Fi и TLS: после защищённого соединения в куче
+  // не остаётся цельного куска, и радио не включалось вовсе.
+  media::prepare();
+
+#if defined(SPEAKER_SPK_SELFTEST)
+  // Стенд: звук проверяется до сети, привязки и TLS. Слышно три тона подряд.
+  audioPipeline.speakerSelfTest();
+#endif
+
   ui.begin();
   // Физический переключатель читается с подавлением дребезга в syncMute():
   // разовый digitalRead на старте мог поймать наводку и «выключить» микрофон.
@@ -362,6 +468,12 @@ void setup() {
   // после диагностических сборок: те включают захват принудительно, а mute
   // должен победить и здесь.
   syncMute();
+
+#if defined(SPEAKER_RADIO_TEST_URL)
+  // Стенд: эфир включается сам, без сервера и без команды. Нужен, чтобы
+  // проверить поток, декодер и I2S на живой станции до интеграции с сервером.
+  media::play(SPEAKER_RADIO_TEST_URL, "проверка эфира");
+#endif
 
 #if defined(SPEAKER_TONE_TEST)
   // Проверка тракта: эталонный тон с пищалки должен вернуться с микрофона
@@ -405,6 +517,10 @@ void loop() {
 #endif
 
   beeper::tick();
+
+#if defined(SPEAKER_RADIO_DNS_TEST)
+  radioDnsProbe();
+#endif
 
   // Строгая сборка без flash-шифрования: только лента с ошибкой, никакой сети,
   // привязки и записи секретов.
@@ -478,6 +594,24 @@ void loop() {
   blePairing.tick();
   deviceConfig.tickVolume();
 
+  // Связь пропала — отпускаем эфир. Переустановка TLS просит около 30 КБ, а
+  // вместе с эфиром их взять негде: рукопожатие падало с
+  // «SSL - Memory allocation failed», колонка не могла подключиться и уходила
+  // в перезагрузку по сторожу. Музыку в этот момент всё равно никто не слышит.
+  {
+    static uint32_t mediaReleaseSince = 0;
+
+    if (speakerLink.isConnected() || !media::active()) {
+      mediaReleaseSince = 0;
+    } else if (mediaReleaseSince == 0) {
+      mediaReleaseSince = millis();
+    } else if (millis() - mediaReleaseSince > 3000) {
+      mediaReleaseSince = 0;
+      applog::line("[media] связи нет — освобождаю память под переподключение");
+      media::stop();
+    }
+  }
+
   // Последняя линия обороны: если связи нет совсем долго, колонка
   // перезагружается сама. Лучше короткий перезапуск, чем «зависла и молчит»:
   // однажды повреждённая куча оставляет сеть в состоянии, из которого нет выхода.
@@ -534,6 +668,35 @@ void loop() {
   // отправлять реплику. Домашняя колонка слушает и без сервера — иначе
   // встроенные команды не работали бы в офлайне. Без этого колонка молчала бы
   // до нажатия кнопки, которой на макете физически нет.
+  // Сторож речи: SPEECH_END может потеряться (обрыв, остановка потока), и тогда
+  // «говорю» висело бы вечно — колонка молчала бы и не слушала.
+  // Отложенный эфир: ждём, когда колонка договорит и куча освободится. Без
+  // таймаута он мог бы ждать вечно, если ответа вообще не будет.
+  if (pendingMediaUrl.length() > 0 && !agentSpeaking
+      && millis() - lastAgentAudioAt > 1200
+      && (ESP.getFreeHeap() >= MEDIA_READY_HEAP
+          || millis() - pendingMediaSince > MEDIA_PENDING_TIMEOUT_MS)) {
+    const String url = pendingMediaUrl;
+    const String title = pendingMediaTitle;
+    pendingMediaUrl = "";
+    pendingMediaTitle = "";
+
+    if (media::play(url, title)) {
+      applog::printf("[media] отложенный эфир пошёл: «%s»\n", title.c_str());
+      ui.setState(AgentState::Speaking);
+    } else {
+      applog::printf("[media] отложенный эфир не запустился, свободно %u\n",
+                     static_cast<unsigned>(ESP.getFreeHeap()));
+    }
+  }
+
+  if (agentSpeaking && millis() - lastAgentAudioAt > 20000) {
+    applog::line("[voice] конец речи потерялся — возвращаю слух");
+    agentSpeaking = false;
+    ui.setState(speakerLink.isConnected() ? AgentState::Idle : AgentState::Offline);
+    media::resumeAfterSpeech();
+  }
+
   const bool muted = syncMute();
 
   if ((speakerLink.isConnected() || (kRole == DeviceRole::Home && deviceConfig.isPaired()))
@@ -557,7 +720,7 @@ void loop() {
       const uint32_t threshold = max<uint32_t>(
           VAD_RMS_ON, audioPipeline.noiseFloor() * VAD_NOISE_ON_X10 / 10);
 
-      applog::printf("[heap] %u внутр, кадров %u, vad %u, темп %u/с, шум %u, порог %u, rms %u, пик %u, zcr %u, речь %u/%u\n",
+      applog::printf("[heap] %u внутр, кадров %u, vad %u, темп %u/с, шум %u, порог %u, rms %u, пик %u, zcr %u, речь %u/%u, потерь %u\n",
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      (unsigned)speakerLink.micFrames(),
                      (unsigned)speakerLink.vadFrames(), (unsigned)fps,
@@ -565,7 +728,16 @@ void loop() {
                      (unsigned)audioPipeline.rms(),
                      (unsigned)burstRms, (unsigned)burstZcr,
                      (unsigned)speakerLink.sayFrames(),
-                     (unsigned)speakerLink.sayBytes());
+                     (unsigned)speakerLink.sayBytes(),
+                     (unsigned)audioPipeline.playbackDrops());
+
+      // Диагностика «молчит»: видно, слушает ли колонка и не залип ли флаг речи.
+      applog::printf("[state] захват %d, агент говорит %d, эфир %d, приём %u, буфер %u\n",
+                     audioPipeline.isCapturing() ? 1 : 0,
+                     agentSpeaking ? 1 : 0,
+                     media::active() ? 1 : 0,
+                     static_cast<unsigned>(media::receivedBytesTotal()),
+                     static_cast<unsigned>(media::bufferedBytes()));
     }
     if (now - lastStateAt >= kStateIntervalMs) {
       lastStateAt = now;

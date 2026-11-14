@@ -1,0 +1,9 @@
+{
+  "name": "minimp3",
+  "version": "0.0.0",
+  "description": "Minimalistic MP3 decoder (public domain, CC0). Взят как есть: platformio.ini не тянет его из реестра, потому что в реестре MP3-декодеры под GPL-3.0 — они заразили бы лицензию прошивки.",
+  "license": "CC0-1.0",
+  "build": {
+    "srcDir": "."
+  }
+}

@@ -18,10 +18,22 @@ constexpr i2s_port_t kMicPort = I2S_NUM_0;
 constexpr i2s_port_t kSpeakerPort = I2S_NUM_1;
 #endif
 
-// Очередь воспроизведения: 8 кадров по 20 мс — 160 мс запаса.
-constexpr int kPlaybackQueueFrames = 8;
+// Очередь воспроизведения: 40 кадров по 20 мс — 800 мс запаса.
+//
+// Раньше здесь было 8 кадров (160 мс). Сервер шлёт речь ровно в темпе
+// реального времени, и любой рывок сети больше 160 мс оставлял усилитель без
+// данных: на слух это щелчки и хрип посреди фразы, хотя звук доходил целиком.
+constexpr int kPlaybackQueueFrames = 40;
+
+// Столько кадров ждём перед началом фразы: буфер должен наполниться, иначе
+// первые слоги рвутся, пока сеть догоняет.
+constexpr int kPlaybackPrimeFrames = 8;
 
 int16_t pixelBuffer[AUDIO_FRAME_SAMPLES];
+
+// Кадр MP3 — до 1152 отсчётов на канал; буфер под запись потока в I2S.
+constexpr size_t kMediaSamples = 1152 * 2;
+int16_t mediaBuffer[kMediaSamples];
 
 // Два микрофона на одной шине: в буфере лежат чередующиеся пары левый/правый.
 int32_t micBuffer[AUDIO_FRAME_SAMPLES * MIC_CHANNEL_COUNT];
@@ -61,6 +73,37 @@ bool installMic() {
   };
 
   return i2s_set_pin(kMicPort, &pins) == ESP_OK;
+}
+
+// Устанавливает драйвер усилителя. Отдельно от installSpeaker(), потому что
+// частота приходит от станции: эфир идёт 44.1 или 48 кГц, а речь — 16 кГц.
+bool installSpeakerAt(uint32_t sampleRate) {
+  const i2s_config_t config = {
+      .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate = sampleRate,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 8,
+      .dma_buf_len = 128,
+      .use_apll = false,
+      .tx_desc_auto_clear = true,
+      .fixed_mclk = 0,
+  };
+
+  if (i2s_driver_install(kSpeakerPort, &config, 0, nullptr) != ESP_OK) {
+    return false;
+  }
+
+  const i2s_pin_config_t pins = {
+      .bck_io_num = pins::SPK_BCLK,
+      .ws_io_num = pins::SPK_LRC,
+      .data_out_num = pins::SPK_DIN,
+      .data_in_num = I2S_PIN_NO_CHANGE,
+  };
+
+  return i2s_set_pin(kSpeakerPort, &pins) == ESP_OK;
 }
 
 bool installSpeaker() {
@@ -191,7 +234,8 @@ bool AudioPipeline::begin() {
   if (!installMic()) {
     applog::line("[audio] микрофон не поднялся — колонка работает без входа");
   }
-  if (!installSpeaker()) {
+  _speakerReady = installSpeaker();
+  if (!_speakerReady) {
     applog::line("[audio] усилитель не поднялся — колонка работает без выхода");
   }
 
@@ -514,18 +558,23 @@ void AudioPipeline::micLoop() {
     const uint32_t vadOff = max<uint32_t>(VAD_RMS_OFF, noise * VAD_NOISE_OFF_X10 / 10);
     _noiseFloor = noise;
 
-    // AGC: тихую речь поднимаем к целевому уровню, громкую не трогаем.
-    // Включается только когда сигнал явно выше фона, поэтому тишина и шум
-    // остаются тихими, а пороги VAD (они считаются по сигналу до AGC) не
-    // зависят от текущего усиления.
+    // AGC: и тихую, и громкую речь приводим к целевому уровню. Громкую не
+    // только не поднимаем, но и приглушаем: у открытого микрофона близкий
+    // голос упирался в ограничитель, срезалось начало слова, и распознаватель
+    // получал «ключи радио» вместо «включи радио». Включается только когда
+    // сигнал явно выше фона, поэтому тишина остаётся тихой, а пороги VAD
+    // (они считаются по сигналу до AGC) не зависят от усиления.
     static float agcBoost = 1.0f;
     float targetBoost = 1.0f;
     if (rms >= MIC_AGC_MIN_RMS && rms > noise * MIC_AGC_NOISE_X) {
-      targetBoost = constrain(MIC_AGC_TARGET / static_cast<float>(rms), 1.0f, MIC_AGC_MAX_BOOST);
+      targetBoost = constrain(MIC_AGC_TARGET / static_cast<float>(rms), MIC_AGC_MIN_BOOST,
+                              MIC_AGC_MAX_BOOST);
     }
-    agcBoost += (targetBoost - agcBoost) * (targetBoost > agcBoost ? 0.35f : 0.05f);
+    // Вниз — быстро (перегрузку надо снимать сразу), вверх — плавно, иначе
+    // шум между словами раздувается до уровня речи.
+    agcBoost += (targetBoost - agcBoost) * (targetBoost < agcBoost ? 0.5f : 0.05f);
 
-    if (agcBoost > 1.02f) {
+    if (agcBoost > 1.02f || agcBoost < 0.98f) {
       for (size_t i = 0; i < used; ++i) {
         pixelBuffer[i] = clampToInt16(
             static_cast<int32_t>(static_cast<float>(pixelBuffer[i]) * agcBoost));
@@ -633,23 +682,267 @@ void AudioPipeline::micLoop() {
   }
 }
 
+void AudioPipeline::speakerSelfTest() {
+  if (!_speakerReady) {
+    applog::line("[spk] проверка не пройдена: драйвер I2S не поднялся");
+    return;
+  }
+
+  // Тоны пишутся прямо в I2S, минуя очередь воспроизведения: она держит
+  // 160 мс, и длинный сигнал из неё вытеснился бы.
+  static const uint16_t kFrequencies[] = {440, 1000, 2000};
+  constexpr uint16_t kToneMs = 400;
+  constexpr size_t kFadeSamples = AUDIO_RATE / 100;  // 10 мс
+  const size_t toneSamples = static_cast<size_t>(AUDIO_RATE) * kToneMs / 1000;
+  int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
+
+  applog::line("[spk] проверка выхода: 440, 1000, 2000 Гц");
+
+  for (uint16_t frequency : kFrequencies) {
+    size_t offset = 0;
+
+    while (offset < toneSamples) {
+      const size_t take = min(toneSamples - offset, static_cast<size_t>(AUDIO_FRAME_SAMPLES));
+
+      for (size_t i = 0; i < take; ++i) {
+        const size_t index = offset + i;
+        float gain = 1.0f;
+
+        // Плавный вход и выход: без них на краях тона слышен щелчок, и
+        // «проверка прошла» путается с «усилитель хрипит».
+        if (index < kFadeSamples) {
+          gain = static_cast<float>(index) / kFadeSamples;
+        } else if (index + kFadeSamples >= toneSamples) {
+          gain = static_cast<float>(toneSamples - index) / kFadeSamples;
+        }
+
+        const int16_t value = static_cast<int16_t>(
+            sinf(2.0f * PI * frequency * index / AUDIO_RATE) * 9000.0f * gain);
+        stereo[i * 2] = value;
+        stereo[i * 2 + 1] = value;
+      }
+
+      size_t written = 0;
+      i2s_write(kSpeakerPort, stereo, take * 2 * sizeof(int16_t), &written,
+                pdMS_TO_TICKS(200));
+      offset += take;
+    }
+  }
+
+  applog::line("[spk] проверка выхода закончена");
+}
+
+void AudioPipeline::leaveMediaMode() {
+  if (!_mediaMode) {
+    return;
+  }
+
+  i2s_driver_uninstall(kSpeakerPort);
+  _mediaMode = false;
+  _mediaRate = 0;
+  _speakerReady = installSpeaker();
+
+  if (!_speakerReady) {
+    applog::line("[media] усилитель не вернулся в режим речи");
+  }
+}
+
+bool AudioPipeline::enterMediaMode(uint32_t sampleRate) {
+  const uint32_t rate = sampleRate > 0 ? sampleRate : AUDIO_RATE;
+
+  if (_mediaMode) {
+    if (rate != _mediaRate) {
+      // Станция сменила частоту посреди эфира: драйвер перестраивается на ходу.
+      i2s_set_clk(kSpeakerPort, rate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+      _mediaRate = rate;
+      designBassShelf(rate);
+    }
+
+    return true;
+  }
+
+  // Речь в очереди не должна прозвучать в чужой частоте.
+  flushPlayback();
+
+  if (_speakerReady) {
+    i2s_driver_uninstall(kSpeakerPort);
+    _speakerReady = false;
+  }
+
+  if (!installSpeakerAt(rate)) {
+    applog::printf("[media] не удалось открыть выход на %u Гц\n", static_cast<unsigned>(rate));
+    _speakerReady = installSpeaker();
+
+    return false;
+  }
+
+  _mediaMode = true;
+  _mediaRate = rate;
+  _mediaLastLeft = 0;
+  _mediaLastRight = 0;
+  designBassShelf(rate);
+
+  return true;
+}
+
+void AudioPipeline::designBassShelf(uint32_t rate) {
+  constexpr float kFrequency = 120.0f;
+  constexpr float kGainDb = 8.0f;
+  constexpr float kQ = 0.707f;
+
+  const float fs = rate > 0 ? static_cast<float>(rate) : static_cast<float>(AUDIO_RATE);
+  const float amp = powf(10.0f, kGainDb / 40.0f);
+  const float w0 = 2.0f * 3.14159265f * kFrequency / fs;
+  const float cosW = cosf(w0);
+  const float sinW = sinf(w0);
+  const float alpha = sinW / (2.0f * kQ);
+  const float root = 2.0f * sqrtf(amp) * alpha;
+
+  const float b0 = amp * ((amp + 1.0f) - (amp - 1.0f) * cosW + root);
+  const float b1 = 2.0f * amp * ((amp - 1.0f) - (amp + 1.0f) * cosW);
+  const float b2 = amp * ((amp + 1.0f) - (amp - 1.0f) * cosW - root);
+  const float a0 = (amp + 1.0f) + (amp - 1.0f) * cosW + root;
+  const float a1 = -2.0f * ((amp - 1.0f) + (amp + 1.0f) * cosW);
+  const float a2 = (amp + 1.0f) + (amp - 1.0f) * cosW - root;
+
+  _bassLeft = MediaBiquad();
+  _bassRight = MediaBiquad();
+
+  _bassLeft.b0 = _bassRight.b0 = b0 / a0;
+  _bassLeft.b1 = _bassRight.b1 = b1 / a0;
+  _bassLeft.b2 = _bassRight.b2 = b2 / a0;
+  _bassLeft.a1 = _bassRight.a1 = a1 / a0;
+  _bassLeft.a2 = _bassRight.a2 = a2 / a0;
+}
+
+size_t AudioPipeline::writeMediaPcm(const int16_t* interleaved, size_t frames) {
+  if (!_mediaMode || interleaved == nullptr || frames == 0) {
+    return 0;
+  }
+
+  // Громкость та же, что у речи. Это не только удобство: на полной шкале
+  // усилитель тянет под ампер, и от USB-порта плата уходит в BROWNOUT_RST —
+  // то есть тише здесь ещё и безопаснее для питания.
+  //
+  // Эфир тише речи: станции сведены с полной шкалой, и на колонке они
+  // перекрывали ответы помощника.
+  const int32_t gain =
+      static_cast<int32_t>(_volume) * _volume * 128 / 10000 * MEDIA_GAIN_PERCENT / 100;
+
+  for (size_t i = 0; i + 1 < frames * 2; i += 2) {
+    const int32_t boostedLeft = static_cast<int32_t>(_bassLeft.process(interleaved[i]));
+    const int32_t boostedRight = static_cast<int32_t>(_bassRight.process(interleaved[i + 1]));
+    const int32_t left = (boostedLeft * gain + 64) >> 7;
+    const int32_t right = (boostedRight * gain + 64) >> 7;
+
+    mediaBuffer[i] = static_cast<int16_t>(
+        left > INT16_MAX ? INT16_MAX : (left < INT16_MIN ? INT16_MIN : left));
+    mediaBuffer[i + 1] = static_cast<int16_t>(
+        right > INT16_MAX ? INT16_MAX : (right < INT16_MIN ? INT16_MIN : right));
+  }
+
+  _mediaLastLeft = mediaBuffer[(frames - 1) * 2];
+  _mediaLastRight = mediaBuffer[(frames - 1) * 2 + 1];
+
+  size_t written = 0;
+  i2s_write(kSpeakerPort, mediaBuffer, frames * 2 * sizeof(int16_t), &written,
+            pdMS_TO_TICKS(1000));
+
+  return written / (2 * sizeof(int16_t));
+}
+
+void AudioPipeline::fadeOutMedia(uint32_t milliseconds) {
+  if (!_mediaMode) {
+    return;
+  }
+
+  const uint32_t rate = _mediaRate > 0 ? _mediaRate : AUDIO_RATE;
+  size_t frames = rate * milliseconds / 1000;
+
+  if (frames == 0) {
+    frames = 1;
+  }
+
+  // frames — это стереопары, а kMediaSamples считает отдельные отсчёты: на
+  // 44.1 кГц 40 мс давали 1764 пары вместо 1152 и затирали соседние буферы.
+  // Отсюда были перезагрузки сразу после «одну секунду» на играющем эфире.
+  constexpr size_t kMaxFadeFrames = kMediaSamples / 2;
+
+  if (frames > kMaxFadeFrames) {
+    frames = kMaxFadeFrames;
+  }
+
+  // Линейный спуск от последнего отсчёта к нулю: волна заканчивается там, где
+  // оборвалась, поэтому переключение на речь не даёт щелчка и «обрывка музыки».
+  for (size_t i = 0; i < frames; ++i) {
+    const int32_t factor = static_cast<int32_t>(frames - i);
+
+    mediaBuffer[i * 2] = static_cast<int16_t>(
+        static_cast<int32_t>(_mediaLastLeft) * factor / static_cast<int32_t>(frames));
+    mediaBuffer[i * 2 + 1] = static_cast<int16_t>(
+        static_cast<int32_t>(_mediaLastRight) * factor / static_cast<int32_t>(frames));
+  }
+
+  size_t written = 0;
+  i2s_write(kSpeakerPort, mediaBuffer, frames * 2 * sizeof(int16_t), &written,
+            pdMS_TO_TICKS(200));
+
+  _mediaLastLeft = 0;
+  _mediaLastRight = 0;
+}
+
 void AudioPipeline::playerLoop() {
   PlaybackChunk chunk;
   int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
+  bool primed = false;
 
   for (;;) {
-    // Ждём с таймаутом, а не вечно: когда речи нет, уровень должен упасть до
-    // нуля, иначе рот останется открытым на последнем слоге.
-    if (playbackQueue == nullptr
-        || xQueueReceive(playbackQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+    if (playbackQueue == nullptr) {
       _outputLevel = 0;
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
-    const uint8_t gainShift = _volume >= 90 ? 0 : (90 - _volume) / 8;
+    // Эфир забрал порт: речь в это время не пишется, иначе два потока
+    // смешались бы в мусор на одной шине.
+    if (_mediaMode) {
+      _outputLevel = 0;
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    // Перед фразой копим запас: сеть отдаёт кадры рывками, и без буфера первые
+    // слоги рвутся щелчками. Ждём не дольше 400 мс — «промолчать совсем» хуже,
+    // чем сыграть с меньшим запасом.
+    if (!primed) {
+      const uint32_t startedAt = millis();
+
+      while (uxQueueMessagesWaiting(playbackQueue) < kPlaybackPrimeFrames
+             && millis() - startedAt < 400) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+      }
+
+      primed = true;
+    }
+
+    // Ждём с таймаутом, а не вечно: когда речи нет, уровень должен упасть до
+    // нуля, иначе рот останется открытым на последнем слоге.
+    if (xQueueReceive(playbackQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+      _outputLevel = 0;
+      primed = false;
+      continue;
+    }
+
+    // Громкость — умножение с округлением, а не сдвиг: сдвиг терял младшие биты
+    // и на тихих местах речи был слышен шершавый шум. Кривая квадратичная: ухо
+    // слышит громкость нелинейно, и при линейной шкале тихие шаги почти не
+    // меняли звук, а верхние — сразу упирались в клип усилителя.
+    const int32_t gain = static_cast<int32_t>(_volume) * _volume * 128 / 10000;
 
     for (size_t i = 0; i < chunk.count; ++i) {
-      const int16_t value = static_cast<int16_t>(chunk.samples[i] >> gainShift);
+      const int32_t scaled = (static_cast<int32_t>(chunk.samples[i]) * gain + 64) >> 7;
+      const int16_t value = static_cast<int16_t>(
+          scaled > INT16_MAX ? INT16_MAX : (scaled < INT16_MIN ? INT16_MIN : scaled));
       stereo[i * 2] = value;
       stereo[i * 2 + 1] = value;
     }
@@ -695,7 +988,10 @@ void AudioPipeline::playPcm(const uint8_t* data, size_t length) {
     chunk.count = static_cast<uint16_t>(take);
     memcpy(chunk.samples, source + offset, take * sizeof(int16_t));
     // Не ждём: если очередь полна, звук лучше потерять, чем заблокировать сеть.
-    xQueueSend(playbackQueue, &chunk, 0);
+    // Но потерю считаем — это единственный признак, что буфера не хватает.
+    if (xQueueSend(playbackQueue, &chunk, 0) != pdTRUE) {
+      ++_playbackDrops;
+    }
     offset += take;
   }
 }

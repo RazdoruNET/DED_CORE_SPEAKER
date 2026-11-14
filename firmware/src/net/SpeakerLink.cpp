@@ -580,6 +580,13 @@ void SpeakerLink::handleBinary(const uint8_t* payload, size_t length) {
     case proto::CMD:
       handleText(payload, length);
       break;
+    // Кусок трека, который сервер перекодировал в MP3: устройство декодирует
+    // его само. Так играет «моя музыка» любого формата — перекодирует сервер.
+    case proto::MEDIA:
+      if (_onMedia) {
+        _onMedia(frame.payload, frame.length);
+      }
+      break;
     default:
       break;
   }
