@@ -360,12 +360,20 @@ void wireAudio() {
       } else if (!media::play(url, title)) {
         applog::line("[media] не удалось начать поток");
       } else {
+        // Новая команда отменяет отложенную: иначе через секунду после речи
+        // сработал бы старый адрес и оборвал только что начатый поток.
+        pendingMediaUrl = "";
+        pendingMediaTitle = "";
         ui.setState(AgentState::Speaking);
       }
     } else if (action == "media.stream") {
       // Трек перекодирует сервер и присылает кадрами MEDIA.
       const String title = args["title"] | "";
       applog::printf("[media] поток от сервера: «%s»\n", title.c_str());
+      // Отложенный эфир отменяем: сервер уже начал новый поток, и старый адрес
+      // вытеснил бы его через секунду.
+      pendingMediaUrl = "";
+      pendingMediaTitle = "";
       media::beginRelay(title);
       ui.setState(AgentState::Speaking);
     } else if (action == "media.stop") {

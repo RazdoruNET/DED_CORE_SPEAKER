@@ -172,6 +172,35 @@ smart-speaker/
 входят: там приватные ключи, сертификаты и код привязки макета.
 Правила — в `.gitignore` рядом с этим файлом.
 
+## Два репозитория: платформа и колонка
+
+Эта папка — копия содержимого отдельного репозитория изделия
+[`RazdoruNET/DED_CORE_SPEAKER`](https://github.com/RazdoruNET/DED_CORE_SPEAKER):
+там `smart-speaker/` лежит в корне. Правки прошивки и документации нужно
+отправлять в оба, иначе версии расходятся — свежая прошивка остаётся в
+платформе, а на странице изделия висит старая.
+
+Как это делается здесь:
+
+```bash
+# 1. обычный коммит в основную платформу
+git -C ~/Documents/GitHub/ded-core-platform commit ...
+
+# 2. то же содержимое — в репозиторий колонки
+rsync -a --delete \
+  --exclude '.git' --exclude '.pio' --exclude '.DS_Store' \
+  --exclude 'Secrets.h' --exclude '.dev' --exclude '.github' \
+  smart-speaker/ /tmp/DED_CORE_SPEAKER/ && \
+  git -C /tmp/DED_CORE_SPEAKER add -A && \
+  git -C /tmp/DED_CORE_SPEAKER commit -m "..." && \
+  git -C /tmp/DED_CORE_SPEAKER push origin HEAD:main
+```
+
+`.github` исключён намеренно: в репозитории изделия workflow обновляется
+Dependabot, и копия из платформы откатила бы его назад.
+`Secrets.h` и `.dev/` не попадают в git ни там, ни там — это правило
+проверяет CI (`hygiene` в `security.yml`).
+
 ## Корпус: файлы для печати
 
 В каталоге [`stl/`](./stl) лежат готовые к печати модели корпуса колонки —
