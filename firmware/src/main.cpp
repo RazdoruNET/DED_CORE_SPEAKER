@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>
 #include <esp_task_wdt.h>
 
 #include "app/Beeper.h"
@@ -63,6 +64,34 @@ constexpr uint32_t kUiBlue = (30u << 16) | (80u << 8) | 240u;
 
 constexpr uint32_t kStateIntervalMs = 10000;
 constexpr uint32_t kHeapLogIntervalMs = 5000;
+
+// Почему плата перезапустилась: без этой строки «перезагружается» не отличить
+// от просадки питания (BROWNOUT), сторожа (WDT) и паники в коде — лечатся они
+// по-разному, а в логе до перезапуска причины не видно.
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "включение питания";
+    case ESP_RST_EXT:
+      return "внешний сброс";
+    case ESP_RST_SW:
+      return "программный перезапуск";
+    case ESP_RST_PANIC:
+      return "паника (исключение в коде)";
+    case ESP_RST_INT_WDT:
+      return "сторож прерываний";
+    case ESP_RST_TASK_WDT:
+      return "сторожевой таймер задач";
+    case ESP_RST_WDT:
+      return "сторожевой таймер";
+    case ESP_RST_BROWNOUT:
+      return "просадка питания (BROWNOUT) — проверьте порт USB и кабель";
+    case ESP_RST_SDIO:
+      return "сброс по SDIO";
+    default:
+      return "неизвестно";
+  }
+}
 
 void openPairingWindow() {
   if (deviceConfig.isPaired()) {
@@ -399,6 +428,7 @@ void setup() {
   applog::printf("\n=== DED CORE SPEAKER %s (%s), LED %u/255 ===\n",
                 SPEAKER_FIRMWARE_VERSION, SPEAKER_PROFILE_NAME,
                 static_cast<unsigned>(LED_BRIGHTNESS_MAX));
+  applog::printf("[boot] прошлый запуск завершился: %s\n", resetReasonName(esp_reset_reason()));
 
 #if defined(SPEAKER_LED_ONLY_TEST)
   // Только лента: без микрофона, Wi-Fi и TLS. Так проверка пайки не зависит

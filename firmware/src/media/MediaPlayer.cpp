@@ -519,13 +519,33 @@ bool beginRelay(const String& title) {
   return start("", title, true);
 }
 
+// Сколько сетевой задаче ждать место в буфере, прежде чем признать кусок
+// потерянным. Дольше нельзя: эта же задача читает сокет и отвечает на ping.
+constexpr uint32_t kFeedWaitMs = 100;
+
 void feed(const uint8_t* data, size_t length) {
   if (!running || !relay || buffer == nullptr || data == nullptr || length == 0) {
     return;
   }
 
-  // Не ждём: лучше потерять кусок, чем заблокировать сетевую задачу. Потери
-  // видны в строке остановки — по ним же понятно, хватает ли буфера.
+  // Кусок должен лечь в буфер целиком. Раньше при полном буфере записывалось,
+  // сколько влезло, и в потоке оставался обрыв кадра: декодер терял
+  // синхронизацию, выбрасывал весь входной буфер и замолкал на полсекунды.
+  // На слух это и есть «подлагивает». Теперь ждём место — поток придерживает
+  // TCP, сервер сам замедляется, — а кусок теряем, только если места нет
+  // и через kFeedWaitMs (или кусок больше самого буфера).
+  const uint32_t startedAt = millis();
+
+  while (xStreamBufferSpacesAvailable(buffer) < length) {
+    if (length > kStreamBytes || !running || millis() - startedAt >= kFeedWaitMs) {
+      droppedBytes += static_cast<uint32_t>(length);
+
+      return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+
   const size_t written = xStreamBufferSend(buffer, data, length, 0);
 
   receivedBytes += static_cast<uint32_t>(written);

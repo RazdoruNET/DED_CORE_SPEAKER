@@ -250,7 +250,7 @@ void SpeakerLink::begin() {
   _path = path;
 
   _ws.setReconnectInterval(WS_RECONNECT_MIN);
-  _ws.enableHeartbeat(WS_HEARTBEAT_MS, 3000, 2);
+  _ws.enableHeartbeat(WS_HEARTBEAT_MS, WS_PONG_TIMEOUT_MS, 2);
 
   _ws.beginSslWithCA(host.c_str(), port, path.c_str(), trustedRoots().c_str());
 
