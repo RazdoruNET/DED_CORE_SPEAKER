@@ -148,7 +148,7 @@ VAD, Opus, ИК, ESP-NOW, датчики — помещаются.
 ## Что лежит в папке
 
 ```
-smart-speaker/
+DED_CORE_SPEAKER/
 ├── README.md                    этот файл: концепт и решения
 ├── LICENSE                      лицензия (некоммерческая, см. ниже)
 ├── LICENSE_EN                   то же на английском
@@ -167,39 +167,23 @@ smart-speaker/
 └── tools/                       проверки протокола (векторы вывода ключа)
 ```
 
-Локальный стенд (`.dev/` рядом с этим файлом; в основном репозитории —
-`smart-speaker/.dev/`) и `firmware/src/config/Secrets.h` в публикацию не
-входят: там приватные ключи, сертификаты и код привязки макета.
+Локальный стенд (`.dev/` рядом с этим файлом) и
+`firmware/src/config/Secrets.h` в публикацию не входят: там приватные ключи,
+сертификаты и код привязки макета.
 Правила — в `.gitignore` рядом с этим файлом.
 
-## Два репозитория: платформа и колонка
+## Где живёт код
 
-Эта папка — копия содержимого отдельного репозитория изделия
-[`RazdoruNET/DED_CORE_SPEAKER`](https://github.com/RazdoruNET/DED_CORE_SPEAKER):
-там `smart-speaker/` лежит в корне. Правки прошивки и документации нужно
-отправлять в оба, иначе версии расходятся — свежая прошивка остаётся в
-платформе, а на странице изделия висит старая.
+Прошивка и документация изделия — только здесь. Раньше эта же папка лежала
+внутри [`ded-core-platform`](https://github.com/RazdoruNET/ded-core-platform)
+как `smart-speaker/`; копии там больше нет, чтобы версии не расходились:
+свежая прошивка оставалась в платформе, а на странице изделия висела старая.
 
-Как это делается здесь:
-
-```bash
-# 1. обычный коммит в основную платформу
-git -C ~/Documents/GitHub/ded-core-platform commit ...
-
-# 2. то же содержимое — в репозиторий колонки
-rsync -a --delete \
-  --exclude '.git' --exclude '.pio' --exclude '.DS_Store' \
-  --exclude 'Secrets.h' --exclude '.dev' --exclude '.github' \
-  smart-speaker/ /tmp/DED_CORE_SPEAKER/ && \
-  git -C /tmp/DED_CORE_SPEAKER add -A && \
-  git -C /tmp/DED_CORE_SPEAKER commit -m "..." && \
-  git -C /tmp/DED_CORE_SPEAKER push origin HEAD:main
-```
-
-`.github` исключён намеренно: в репозитории изделия workflow обновляется
-Dependabot, и копия из платформы откатила бы его назад.
-`Secrets.h` и `.dev/` не попадают в git ни там, ни там — это правило
-проверяет CI (`hygiene` в `security.yml`).
+Платформа знает про колонку со своей стороны: `AssistantService`
+(`SpeakerGateway`, `SpeakerController`) держит второй WebSocket, а образы для
+страницы DIY собирает `deploy/publish-free-firmware.sh` — он ищет этот
+репозиторий рядом с платформой (`../DED_CORE_SPEAKER`), внутри неё или по
+переменной `DEDCORE_SPEAKER_DIR`.
 
 ## Корпус: файлы для печати
 
@@ -221,7 +205,7 @@ Dependabot, и копия из платформы откатила бы его �
 ## Быстрый старт прошивки
 
 ```bash
-cd smart-speaker/firmware
+cd firmware
 pio run -e esp32da            # сборка под ESP32-WROOM-DA
 pio run -e esp32da -t upload  # прошивка
 pio device monitor -b 115200
