@@ -4,6 +4,12 @@
 
 #include <functional>
 
+#include "config/AppConfig.h"
+
+#if SPEAKER_HAS_AEC
+#include "audio/EchoCanceller.h"
+#endif
+
 // Аудиотракт: микрофоны на I2S0, усилитель на I2S1.
 //
 // Преролл существует из-за wake word: детектор срабатывает через 200–400 мс
@@ -43,6 +49,11 @@ class AudioPipeline {
 
   void playPcm(const uint8_t* data, size_t length);
   void flushPlayback();
+
+  /// Очередь речи пуста и хвост последнего кадра уже отзвучал в воздухе.
+  /// По этому признаку микрофон возвращается после SPEECH_END: иначе он
+  /// слышит собственный голос агента из буфера воспроизведения.
+  bool playbackIdle() const;
 
   /// Проверка выходного тракта без сервера: три тона прямо в I2S. Нужна, чтобы
   /// убедиться в пайке усилителя и динамика до подключения к сети. Вызывается
@@ -100,9 +111,18 @@ class AudioPipeline {
   void playerLoop();
   void emitFrame(const int16_t* samples);
 
+  /// Порт усилителя один, а пишут в него две задачи: речь и эфир. Замок берёт
+  /// каждая запись и каждая смена драйвера (речь ↔ эфир), иначе одна задача
+  /// успевала начать i2s_write, пока другая уже удаляла драйвер.
+  bool takeSpeakerPort(uint32_t timeoutMs);
+  void releaseSpeakerPort();
+  void drainPlayback(uint32_t milliseconds);
+
   bool _ready = false;
-  bool _speakerReady = false;
-  bool _mediaMode = false;
+  /// Флаги читаются из трёх задач, поэтому volatile: без него компилятор
+  /// вправе держать значение в регистре и не заметить смену режима.
+  volatile bool _speakerReady = false;
+  volatile bool _mediaMode = false;
   uint32_t _mediaRate = 0;
 
   /// Низкая полка для эфира: у 4-омного динамика в корпусе нет низа, и
@@ -144,6 +164,24 @@ class AudioPipeline {
   /// До какого момента микрофон молчит принудительно (0 — не молчит).
   volatile uint32_t _hushUntil = 0;
 
+  /// «Пол» остатка эха: типичный уровень музыки после компенсатора. Порог
+  /// речи при играющем эфире считается от него, а не от пика — иначе колонка
+  /// глохнет на всё время музыки.
+  volatile uint32_t _mediaNoiseFloor = 0;
+
+  /// Приглушение эфира на время фразы. 1.0 — полная громкость, 0.0 — тишина.
+  /// Цель ставит задача записи, плавно отрабатывает задача медиа.
+  volatile float _mediaDuckTarget = 1.0f;
+  volatile float _mediaDuckGain = 1.0f;
+
+  /// Автолимитер эфира: держит музыку настолько тихой, чтобы микрофон не
+  /// клиппировал. Без этого компенсатор бесполезен, а голос не разобрать.
+  volatile float _mediaLimitGain = 1.0f;
+
+  /// Пока эхо не оценено, детектор речи закрыт: первые кадры музыки иначе
+  /// принимаются за начало фразы.
+  volatile uint32_t _mediaVadHoldUntil = 0;
+
   /// Захват останавливали посреди фразы: задаче записи нужно сбросить VAD.
   volatile bool _flushVad = false;
 
@@ -156,6 +194,11 @@ class AudioPipeline {
 
   /// Сколько кадров в кольце преролла действительно записано с прошлого сброса.
   size_t _prerollValid = 0;
+
+  /// До какого момента ещё звучит хвост последнего отданного кадра речи.
+  volatile uint32_t _playbackQuietUntil = 0;
+
+  SemaphoreHandle_t _speakerLock = nullptr;
 
   uint8_t _volume = 60;
   uint32_t _lastRms = 0;
@@ -175,6 +218,10 @@ class AudioPipeline {
 
   TaskHandle_t _micTask = nullptr;
   TaskHandle_t _playerTask = nullptr;
+
+#if SPEAKER_HAS_AEC
+  EchoCanceller _aec;
+#endif
 };
 
 extern AudioPipeline audioPipeline;

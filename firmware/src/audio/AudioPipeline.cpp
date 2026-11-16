@@ -33,6 +33,12 @@ int16_t pixelBuffer[AUDIO_FRAME_SAMPLES];
 
 // Кадр MP3 — до 1152 отсчётов на канал; буфер под запись потока в I2S.
 constexpr size_t kMediaSamples = 1152 * 2;
+
+// Куски, которыми эфир пишется в I2S. Блок MP3 (1152 кадра на 44.1 кГц — это
+// 26 мс) длиннее очереди DMA (1024 кадра, 23 мс): если отдать референс
+// компенсатору целиком, его отсчёты зазвучат вразброс на 26 мс, и фильтр с
+// постоянной задержкой такое эхо вычесть не сможет. 256 кадров — 6 мс.
+constexpr size_t kMediaAecChunk = 256;
 int16_t mediaBuffer[kMediaSamples];
 
 // Два микрофона на одной шине: в буфере лежат чередующиеся пары левый/правый.
@@ -54,7 +60,10 @@ bool installMic() {
       .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 8,
+      // Четыре буфера по 8 мс, а не восемь: кадр, который отдаёт драйвер, к
+      // этому моменту уже 32 мс как записан. Чем длиннее эта очередь, тем
+      // позже эхо приходит в компенсатор — и тем длиннее должен быть фильтр.
+      .dma_buf_count = 4,
       .dma_buf_len = 128,
       .use_apll = false,
       .tx_desc_auto_clear = false,
@@ -231,6 +240,13 @@ bool AudioPipeline::begin() {
     return true;
   }
 
+  // Замок порта создаём до задач: первая же смена режима «речь ↔ эфир» иначе
+  // попадёт в незащищённый i2s_write.
+  _speakerLock = xSemaphoreCreateMutex();
+  if (_speakerLock == nullptr) {
+    applog::line("[audio] нет замка порта усилителя");
+  }
+
   if (!installMic()) {
     applog::line("[audio] микрофон не поднялся — колонка работает без входа");
   }
@@ -251,11 +267,29 @@ bool AudioPipeline::begin() {
     applog::line("[audio] нет очереди воспроизведения");
   }
 
+#if SPEAKER_HAS_AEC
+  _aec.begin();
+#endif
+
   xTaskCreatePinnedToCore(micTaskEntry, "mic", 6144, this, 10, &_micTask, 1);
   xTaskCreatePinnedToCore(playerTaskEntry, "spk", 4096, this, 7, &_playerTask, 0);
 
   _ready = true;
   return true;
+}
+
+bool AudioPipeline::takeSpeakerPort(uint32_t timeoutMs) {
+  if (_speakerLock == nullptr) {
+    return true;
+  }
+
+  return xSemaphoreTake(_speakerLock, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+void AudioPipeline::releaseSpeakerPort() {
+  if (_speakerLock != nullptr) {
+    xSemaphoreGive(_speakerLock);
+  }
 }
 
 void AudioPipeline::micTaskEntry(void* arg) {
@@ -436,6 +470,15 @@ void AudioPipeline::micLoop() {
     }
 #endif
 
+#if SPEAKER_HAS_AEC
+    // Эхо собственной музыки вычитается до детектора речи. Без этого порог
+    // приходится поднимать выше самой музыки, и колонка «глохнет» на всё время
+    // эфира: в поток уходит музыка, а голос поверх неё не разобрать.
+    if (_mediaMode) {
+      _aec.process(pixelBuffer, used);
+    }
+#endif
+
     ++_framesCaptured;
 
     _lastRmsLeft = static_cast<uint32_t>(sqrt(static_cast<double>(sumLeft) / used));
@@ -480,7 +523,7 @@ void AudioPipeline::micLoop() {
         SNEEZE_RMS_START, noiseFloor > 0 ? static_cast<uint32_t>(noiseFloor) * 8 : 0);
 
     if (!sneezeActive) {
-      if (_capturing && !voiceActive && rms >= sneezeThreshold
+      if (_capturing && !voiceActive && !_mediaMode && rms >= sneezeThreshold
           && nowMs - _lastSneezeAt >= SNEEZE_COOLDOWN_MS) {
         sneezeActive = true;
         sneezeFrames = 1;
@@ -535,9 +578,24 @@ void AudioPipeline::micLoop() {
       windowMin = rms;
     }
     if (++windowFrames >= 10) {
+      // При играющем эфире то же окно минимумов даёт «пол» остатка музыки.
+      // Он затухает медленно (1/8 за окно), чтобы тихий такт песни не снял
+      // порог, и не обновляется во время фразы — иначе голос поднял бы его.
+      if (_mediaMode && !voiceActive) {
+        const uint32_t floorValue = windowMin;
+        if (_mediaNoiseFloor == 0) {
+          _mediaNoiseFloor = floorValue;
+        } else {
+          _mediaNoiseFloor = (_mediaNoiseFloor * 7 + floorValue) / 8;
+        }
+      }
+
       // Пока человек говорит, окно не трогаем: его паузы всё равно громче
       // комнаты, и фон «подполз» бы вверх за одну длинную фразу.
-      if (!voiceActive) {
+      //
+      // При играющем эфире фон тоже не трогаем: это не шум комнаты, а наша
+      // собственная музыка, и порог от неё считается отдельно (ниже).
+      if (!voiceActive && !_mediaMode) {
         if (noiseFloor <= 0) {
           noiseFloor = static_cast<int32_t>(windowMin);
         } else {
@@ -554,9 +612,66 @@ void AudioPipeline::micLoop() {
     // на скрип кресла и стук по столу. Отсюда 2.4× на включение и 1.8× на
     // выключение — порог адаптивный, но заметно ниже прежних 5× и 3×.
     const uint32_t noise = static_cast<uint32_t>(noiseFloor > 0 ? noiseFloor : 0);
-    const uint32_t vadOn = max<uint32_t>(VAD_RMS_ON, noise * VAD_NOISE_ON_X10 / 10);
-    const uint32_t vadOff = max<uint32_t>(VAD_RMS_OFF, noise * VAD_NOISE_OFF_X10 / 10);
+    uint32_t vadOn = max<uint32_t>(VAD_RMS_ON, noise * VAD_NOISE_ON_X10 / 10);
+    uint32_t vadOff = max<uint32_t>(VAD_RMS_OFF, noise * VAD_NOISE_OFF_X10 / 10);
+
+    // При играющем эфире порог считается от остатка эха, а не от «фона
+    // комнаты»: комната с работающим динамиком тише динамика не бывает.
+    //
+    // Важно, что берётся именно ПОЛ остатка, а не его пик. Пик — это самый
+    // громкий такт музыки; порог от него уходил на 7–20 тысяч, и голос с
+    // двух метров (900–1400) не проходил никогда: колонка полностью глохла
+    // на всё время эфира. Пол же близок к типичному остатку, и голос,
+    // поднимающий уровень втрое, проходит.
+    const bool mediaHold = _mediaMode && nowMs < _mediaVadHoldUntil;
+
+    if (_mediaMode) {
+#if SPEAKER_HAS_AEC
+      // Микрофон упирается в предел раньше, чем это слышно: в закрытом корпусе
+      // музыка даёт в микрофоне пики 22–26 тысяч из 32. На клиппированном
+      // сигнале линейный компенсатор бесполезен (замер на плате: гашение
+      // 1.2 дБ), а голос поверх музыки распознать нечем. Поэтому эфир
+      // приглушается ровно настолько, чтобы микрофон оставался линейным, и
+      // возвращается, когда музыка стихает.
+      const uint32_t micIn = _aec.inputRms();
+      if (micIn > MEDIA_ECHO_CLIP_RMS && _mediaLimitGain > MEDIA_LIMIT_MIN_GAIN) {
+        _mediaLimitGain -= MEDIA_LIMIT_STEP;
+        if (_mediaLimitGain < MEDIA_LIMIT_MIN_GAIN) {
+          _mediaLimitGain = MEDIA_LIMIT_MIN_GAIN;
+        }
+      } else if (micIn < MEDIA_ECHO_CLIP_RMS / 2 && _mediaLimitGain < 1.0f) {
+        _mediaLimitGain += MEDIA_LIMIT_STEP / 4;
+        if (_mediaLimitGain > 1.0f) {
+          _mediaLimitGain = 1.0f;
+        }
+      }
+#endif
+
+      const uint32_t echoFloor = _mediaNoiseFloor;
+      vadOn = max<uint32_t>(vadOn, echoFloor * MEDIA_ECHO_ON_X10 / 10);
+      vadOff = max<uint32_t>(vadOff, echoFloor * MEDIA_ECHO_OFF_X10 / 10);
+    }
+
     _noiseFloor = noise;
+
+#if SPEAKER_HAS_AEC
+    // Диагностика на живой плате: по задержке видно, что корреляция нашлась, а
+    // по гашению — помогает ли компенсатор или порог держится только запасом.
+    {
+      static uint32_t lastAecLog = 0;
+      if (_mediaMode && nowMs - lastAecLog >= 5000) {
+        lastAecLog = nowMs;
+        applog::printf("[aec] пик %.2f на %u мс, задержка %u мс, микрофон %u -> %u, "
+                       "гашение %.1f дБ, порог %u, пол %u\n",
+                       _aec.probeScore(), static_cast<unsigned>(_aec.probeLagMs()),
+                       static_cast<unsigned>(_aec.delayMs()),
+                       static_cast<unsigned>(_aec.inputRms()),
+                       static_cast<unsigned>(_aec.outputRms()), _aec.erleDb(),
+                       static_cast<unsigned>(vadOn),
+                       static_cast<unsigned>(_mediaNoiseFloor));
+      }
+    }
+#endif
 
     // AGC: и тихую, и громкую речь приводим к целевому уровню. Громкую не
     // только не поднимаем, но и приглушаем: у открытого микрофона близкий
@@ -607,11 +722,12 @@ void AudioPipeline::micLoop() {
     }
 
     if (!voiceActive) {
-      if (rms >= vadOn) {
+      if (rms >= vadOn && !mediaHold) {
         voiceActive = true;
         silenceFrames = 0;
         speechFrames = 0;
         phraseFrames = 0;
+
         if (_onVad) {
           _onVad(true, rms);
         }
@@ -654,6 +770,16 @@ void AudioPipeline::micLoop() {
 
     ++phraseFrames;
 
+    // Эфир уходит в тишину не в момент срабатывания, а когда фраза уже
+    // подтвердилась: иначе стук посуды выключал музыку на доли секунды.
+    // Дальше распознаватель получает голос без музыки, а не микс из динамика
+    // и человека.
+#if !defined(SPEAKER_MEDIA_NO_DUCK)
+    if (_mediaMode && phraseFrames == MEDIA_DUCK_AFTER_FRAMES) {
+      _mediaDuckTarget = 0.0f;
+    }
+#endif
+
     if (rms >= vadOff) {
       silenceFrames = 0;
       ++speechFrames;
@@ -678,6 +804,13 @@ void AudioPipeline::micLoop() {
         _onVad(false, rms);
       }
       _capturing = false;
+
+      if (_mediaMode) {
+        // Эфир возвращается сам, но не мгновенно: пока он поднимается, порог
+        // уже не должен ловить собственный динамик.
+        _mediaDuckTarget = 1.0f;
+        _mediaVadHoldUntil = millis() + MEDIA_VAD_RESTORE_MS;
+      }
     }
   }
 }
@@ -737,10 +870,27 @@ void AudioPipeline::leaveMediaMode() {
     return;
   }
 
+  // Драйвер переставляем только когда задача речи не пишет в порт. Флаг режима
+  // снимаем последним, уже после установки драйвера речи: иначе задача речи
+  // успела бы отдать кадр в удалённый драйвер.
+  const bool owned = takeSpeakerPort(2000);
   i2s_driver_uninstall(kSpeakerPort);
-  _mediaMode = false;
   _mediaRate = 0;
   _speakerReady = installSpeaker();
+  _mediaMode = false;
+  if (owned) {
+    releaseSpeakerPort();
+  }
+
+  // Эхо кончилось вместе с музыкой: оценку и веса фильтра держать незачем.
+  _mediaNoiseFloor = 0;
+  _mediaDuckTarget = 1.0f;
+  _mediaDuckGain = 1.0f;
+  _mediaLimitGain = 1.0f;
+  _mediaVadHoldUntil = 0;
+#if SPEAKER_HAS_AEC
+  _aec.reset();
+#endif
 
   if (!_speakerReady) {
     applog::line("[media] усилитель не вернулся в режим речи");
@@ -753,16 +903,38 @@ bool AudioPipeline::enterMediaMode(uint32_t sampleRate) {
   if (_mediaMode) {
     if (rate != _mediaRate) {
       // Станция сменила частоту посреди эфира: драйвер перестраивается на ходу.
+      const bool owned = takeSpeakerPort(2000);
       i2s_set_clk(kSpeakerPort, rate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
       _mediaRate = rate;
       designBassShelf(rate);
+      if (owned) {
+        releaseSpeakerPort();
+      }
+#if SPEAKER_HAS_AEC
+      // Референс теперь другого темпа: старые веса и задержка к нему не годятся.
+      _aec.reset();
+      _mediaVadHoldUntil = millis() + MEDIA_VAD_HOLD_MS;
+#endif
     }
 
     return true;
   }
 
-  // Речь в очереди не должна прозвучать в чужой частоте.
+  // Даём доиграть уже полученной речи: сервер закрывает поток раньше, чем
+  // колонка отыграла буфер, и прежний сброс резал последний слог ответа.
+  drainPlayback(PLAYBACK_DRAIN_MS);
+
+  // То, что не доиграло за отведённое время, в чужой частоте звучать не должно.
   flushPlayback();
+
+  // Флаг поднимаем до захвата порта: задача речи, которая уже пишет кадр,
+  // спокойно его допишет, а следующую запись не начнёт.
+  _mediaMode = true;
+
+  if (!takeSpeakerPort(2000)) {
+    _mediaMode = false;
+    return false;
+  }
 
   if (_speakerReady) {
     i2s_driver_uninstall(kSpeakerPort);
@@ -772,17 +944,48 @@ bool AudioPipeline::enterMediaMode(uint32_t sampleRate) {
   if (!installSpeakerAt(rate)) {
     applog::printf("[media] не удалось открыть выход на %u Гц\n", static_cast<unsigned>(rate));
     _speakerReady = installSpeaker();
+    _mediaMode = false;
+    releaseSpeakerPort();
 
     return false;
   }
 
-  _mediaMode = true;
   _mediaRate = rate;
   _mediaLastLeft = 0;
   _mediaLastRight = 0;
   designBassShelf(rate);
 
+  // Музыка начинается с полной громкости, а эхо ещё не измерено: пока
+  // компенсатор не сошёлся, детектор речи закрыт, иначе первые кадры эфира
+  // уходят на сервер как «фраза».
+  _mediaNoiseFloor = 0;
+  _mediaDuckTarget = 1.0f;
+  _mediaDuckGain = 1.0f;
+  _mediaLimitGain = 1.0f;
+  _mediaVadHoldUntil = millis() + MEDIA_VAD_HOLD_MS;
+#if SPEAKER_HAS_AEC
+  _aec.reset();
+#endif
+
+  releaseSpeakerPort();
+
   return true;
+}
+
+bool AudioPipeline::playbackIdle() const {
+  if (playbackQueue != nullptr && uxQueueMessagesWaiting(playbackQueue) > 0) {
+    return false;
+  }
+
+  return static_cast<int32_t>(millis() - _playbackQuietUntil) >= 0;
+}
+
+void AudioPipeline::drainPlayback(uint32_t milliseconds) {
+  const uint32_t startedAt = millis();
+
+  while (!playbackIdle() && millis() - startedAt < milliseconds) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
 void AudioPipeline::designBassShelf(uint32_t rate) {
@@ -826,14 +1029,37 @@ size_t AudioPipeline::writeMediaPcm(const int16_t* interleaved, size_t frames) {
   //
   // Эфир тише речи: станции сведены с полной шкалой, и на колонке они
   // перекрывали ответы помощника.
-  const int32_t gain =
-      static_cast<int32_t>(_volume) * _volume * 128 / 10000 * MEDIA_GAIN_PERCENT / 100;
+  const float baseGain = static_cast<float>(
+      static_cast<int32_t>(_volume) * _volume * 128 / 10000 * MEDIA_GAIN_PERCENT / 100)
+      / 128.0f;
+
+  // Пока колонка слушает фразу, эфир уходит в тишину: распознавателю нужен
+  // голос, а не музыка поверх него. Переход плавный, иначе в динамике щелчок.
+  const float duckTarget = _mediaDuckTarget * _mediaLimitGain;
+  const float duckStep = _mediaRate > 0
+                             ? 1000.0f / (MEDIA_DUCK_MS * static_cast<float>(_mediaRate))
+                             : 1.0f;
+  float duck = _mediaDuckGain;
 
   for (size_t i = 0; i + 1 < frames * 2; i += 2) {
     const int32_t boostedLeft = static_cast<int32_t>(_bassLeft.process(interleaved[i]));
     const int32_t boostedRight = static_cast<int32_t>(_bassRight.process(interleaved[i + 1]));
-    const int32_t left = (boostedLeft * gain + 64) >> 7;
-    const int32_t right = (boostedRight * gain + 64) >> 7;
+
+    if (duck < duckTarget) {
+      duck += duckStep;
+      if (duck > duckTarget) {
+        duck = duckTarget;
+      }
+    } else if (duck > duckTarget) {
+      duck -= duckStep;
+      if (duck < duckTarget) {
+        duck = duckTarget;
+      }
+    }
+
+    const float gain = baseGain * duck;
+    const int32_t left = static_cast<int32_t>(boostedLeft * gain);
+    const int32_t right = static_cast<int32_t>(boostedRight * gain);
 
     mediaBuffer[i] = static_cast<int16_t>(
         left > INT16_MAX ? INT16_MAX : (left < INT16_MIN ? INT16_MIN : left));
@@ -841,12 +1067,32 @@ size_t AudioPipeline::writeMediaPcm(const int16_t* interleaved, size_t frames) {
         right > INT16_MAX ? INT16_MAX : (right < INT16_MIN ? INT16_MIN : right));
   }
 
+  _mediaDuckGain = duck;
+
   _mediaLastLeft = mediaBuffer[(frames - 1) * 2];
   _mediaLastRight = mediaBuffer[(frames - 1) * 2 + 1];
 
+  // Каждый кусок отдаём компенсатору прямо перед записью в I2S: так референс
+  // и звук в динамике расходятся не больше чем на длину куска.
   size_t written = 0;
-  i2s_write(kSpeakerPort, mediaBuffer, frames * 2 * sizeof(int16_t), &written,
-            pdMS_TO_TICKS(1000));
+  for (size_t offset = 0; offset < frames; offset += kMediaAecChunk) {
+    const size_t chunk = min(kMediaAecChunk, frames - offset);
+
+    // Под замком только запись: кусок — 6 мс, дольше порт никто не держит.
+    if (!takeSpeakerPort(1000)) {
+      continue;
+    }
+
+#if SPEAKER_HAS_AEC
+    _aec.pushPlayback(mediaBuffer + offset * 2, chunk, _mediaRate);
+#endif
+
+    size_t part = 0;
+    i2s_write(kSpeakerPort, mediaBuffer + offset * 2, chunk * 2 * sizeof(int16_t), &part,
+              pdMS_TO_TICKS(1000));
+    written += part;
+    releaseSpeakerPort();
+  }
 
   return written / (2 * sizeof(int16_t));
 }
@@ -884,8 +1130,12 @@ void AudioPipeline::fadeOutMedia(uint32_t milliseconds) {
   }
 
   size_t written = 0;
+  const bool owned = takeSpeakerPort(1000);
   i2s_write(kSpeakerPort, mediaBuffer, frames * 2 * sizeof(int16_t), &written,
             pdMS_TO_TICKS(200));
+  if (owned) {
+    releaseSpeakerPort();
+  }
 
   _mediaLastLeft = 0;
   _mediaLastRight = 0;
@@ -925,13 +1175,36 @@ void AudioPipeline::playerLoop() {
       primed = true;
     }
 
-    // Ждём с таймаутом, а не вечно: когда речи нет, уровень должен упасть до
-    // нуля, иначе рот останется открытым на последнем слоге.
-    if (xQueueReceive(playbackQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+    // Порт берём до чтения очереди: пока держим замок, задача эфира не может
+    // удалить драйвер посреди записи. Ожидание кадра — до 100 мс, поэтому
+    // переход в эфир задерживается не дольше этого времени.
+    if (!takeSpeakerPort(100)) {
+      _outputLevel = 0;
+      primed = false;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Режим мог переключиться, пока ждали замок.
+    if (_mediaMode) {
+      releaseSpeakerPort();
       _outputLevel = 0;
       primed = false;
       continue;
     }
+
+    // Ждём с таймаутом, а не вечно: когда речи нет, уровень должен упасть до
+    // нуля, иначе рот останется открытым на последнем слоге.
+    if (xQueueReceive(playbackQueue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+      releaseSpeakerPort();
+      _outputLevel = 0;
+      primed = false;
+      continue;
+    }
+
+    // Кадр уже вне очереди, но ещё не прозвучал: помечаем хвост сразу, иначе
+    // микрофон мог вернуться в этот зазор.
+    _playbackQuietUntil = millis() + PLAYBACK_TAIL_MS;
 
     // Громкость — умножение с округлением, а не сдвиг: сдвиг терял младшие биты
     // и на тихих местах речи был слышен шершавый шум. Кривая квадратичная: ухо
@@ -950,6 +1223,11 @@ void AudioPipeline::playerLoop() {
     size_t written = 0;
     i2s_write(kSpeakerPort, stereo, chunk.count * 2 * sizeof(int16_t), &written,
               pdMS_TO_TICKS(200));
+    releaseSpeakerPort();
+
+    // Хвост отзвучит не сразу: пока он звучит в комнате, микрофон возвращать
+    // нельзя, иначе он запишет собственный голос агента.
+    _playbackQuietUntil = millis() + PLAYBACK_TAIL_MS;
 
     // Уровень отданного звука — для анимации рта агента. Считаем по тому, что
     // реально ушло в усилитель: громкость уже применена, и рот открывается
@@ -971,6 +1249,13 @@ void AudioPipeline::stopCapture() {
   _capturing = false;
   // Сброс детектора произойдёт в задаче записи: сюда она не должна заглядывать.
   _flushVad = true;
+
+  // Эфир возвращается, если фразу закрыли извне ( mute, речь агента): иначе
+  // музыка осталась бы в тишине до следующей команды.
+  if (_mediaMode) {
+    _mediaDuckTarget = 1.0f;
+    _mediaVadHoldUntil = millis() + MEDIA_VAD_RESTORE_MS;
+  }
 }
 
 void AudioPipeline::playPcm(const uint8_t* data, size_t length) {
@@ -1001,6 +1286,9 @@ void AudioPipeline::flushPlayback() {
     xQueueReset(playbackQueue);
   }
 
+  // В очереди DMA ещё до 64 мс звука: для микрофона это такой же хвост, как
+  // и доигранный кадр.
+  _playbackQuietUntil = millis() + PLAYBACK_TAIL_MS;
   _outputLevel = 0;
 }
 

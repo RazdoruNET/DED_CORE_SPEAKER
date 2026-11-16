@@ -464,6 +464,19 @@ void setup() {
   applog::printf("[boot] устройство %s, свободно %u байт\n", deviceId.c_str(),
                 ESP.getFreeHeap());
 
+  // Прошлый запуск сорвался по питанию: усилителю не хватило порта или кабеля.
+  // Если оставить громкость из NVS, колонка заиграет так же громко и снова
+  // уйдёт в перезагрузку — на слабом порту это бесконечный цикл. Поэтому после
+  // просадки громкость сбрасывается на щадящую и сохраняется: поднять её можно
+  // кнопкой или командой сервера, а зацикливания не будет.
+  if (esp_reset_reason() == ESP_RST_BROWNOUT && deviceConfig.volume > BROWNOUT_VOLUME) {
+    applog::printf("[boot] была просадка питания: громкость %u -> %u\n",
+                   static_cast<unsigned>(deviceConfig.volume),
+                   static_cast<unsigned>(BROWNOUT_VOLUME));
+    deviceConfig.volume = BROWNOUT_VOLUME;
+    deviceConfig.saveVolume();
+  }
+
   beeper::begin();
   beeper::boot();
 
@@ -645,8 +658,13 @@ void loop() {
       mediaReleaseSince = millis();
     } else if (millis() - mediaReleaseSince > 3000) {
       mediaReleaseSince = 0;
+#if !defined(SPEAKER_MEDIA_NO_DUCK)
+      // В диагностике компенсатора эфир не останавливаем: без связи с сервером
+      // он всё равно останавливался бы через три секунды, и замеру гашения
+      // не на чем жить.
       applog::line("[media] связи нет — освобождаю память под переподключение");
       media::stop();
+#endif
     }
   }
 
@@ -737,8 +755,12 @@ void loop() {
 
   const bool muted = syncMute();
 
+  // Слух возвращаем только когда агент не говорит И доиграл буфер: SPEECH_END
+  // приходит раньше, чем отзвучал последний кадр, а компенсатора эха для
+  // речевого пути нет — микрофон записал бы собственный голос колонки.
   if ((speakerLink.isConnected() || (kRole == DeviceRole::Home && deviceConfig.isPaired()))
-      && !muted && !agentSpeaking && !audioPipeline.isCapturing()) {
+      && !muted && !agentSpeaking && audioPipeline.playbackIdle()
+      && !audioPipeline.isCapturing()) {
     audioPipeline.startCapture();
   }
 
