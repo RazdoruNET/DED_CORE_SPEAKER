@@ -17,6 +17,12 @@ constexpr float kDelayMinScore = 0.65f;
 // Насколько новая задержка должна быть лучше текущей, чтобы её принять.
 constexpr float kDelayJumpMargin = 1.15f;
 
+// Сколько измерений подряд новая задержка должна подтвердиться, прежде чем
+// окно фильтра переедет. У ритмичной музыки корреляция даёт несколько почти
+// равных пиков (на живой плате — 20, 30, 47 и 60 мс), и одиночный «лучший»
+// пик уводил фильтр на чужой путь.
+constexpr uint32_t kDelayPersistHits = 5;
+
 // Референс должен быть слышен: по тишине задержку не измерить.
 constexpr float kDelayMinRefPower = 1.0e-5f;
 
@@ -51,6 +57,8 @@ void EchoCanceller::begin() {
 void EchoCanceller::reset() {
   _count.store(0, std::memory_order_release);
   _delay = kDelaySeed;
+  _delayCandidate = kDelaySeed;
+  _delayHits = 0;
   _framesSinceDelay = 0;
   _framesSinceReset = 0;
   _adaptNext = true;
@@ -222,6 +230,37 @@ float EchoCanceller::delayScore(size_t count, uint32_t lag, float micPower,
   return dot / sqrtf(refPower * micPower + 1.0e-20f);
 }
 
+void EchoCanceller::shiftTaps(int32_t delta) {
+  const int32_t taps = static_cast<int32_t>(kTaps);
+
+  if (delta >= taps || -delta >= taps) {
+    for (float& value : _taps) {
+      value = 0.0f;
+    }
+    return;
+  }
+
+  // Окно сдвинулось на delta позже: тот же участок сигнала теперь на delta
+  // ближе к началу, то есть веса переезжают к младшим индексам.
+  if (delta > 0) {
+    for (int32_t j = 0; j + delta < taps; ++j) {
+      _taps[j] = _taps[j + delta];
+    }
+    for (int32_t j = taps - delta; j < taps; ++j) {
+      _taps[j] = 0.0f;
+    }
+    return;
+  }
+
+  const int32_t back = -delta;
+  for (int32_t j = taps - 1; j >= back; --j) {
+    _taps[j] = _taps[j - back];
+  }
+  for (int32_t j = 0; j < back; ++j) {
+    _taps[j] = 0.0f;
+  }
+}
+
 void EchoCanceller::estimateDelay(const int16_t* mic, size_t count) {
   float micPower = 0.0f;
   for (size_t i = 0; i < count; ++i) {
@@ -275,24 +314,68 @@ void EchoCanceller::estimateDelay(const int16_t* mic, size_t count) {
   // измерении: фильтр не успевал ни за одной. Берём самый сильный пик, но
   // двигаем задержку, только если он заметно сильнее текущего места.
   if (best == _delay) {
+    _delayHits = 0;
     return;
   }
 
-  const bool jump = (best > _delay ? best - _delay : _delay - best) > kDelayJumpSamples;
-  if (jump) {
-    const float current = delayScore(count, _delay, micPower, mic);
-    if (bestScore < current * kDelayJumpMargin) {
-      return;
-    }
+  const int32_t delta = static_cast<int32_t>(best) - static_cast<int32_t>(_delay);
+  const uint32_t distance =
+      delta > 0 ? static_cast<uint32_t>(delta) : static_cast<uint32_t>(-delta);
 
-    // Задержка действительно уехала: старые веса описывают другой участок
-    // сигнала, и их проще начать заново, чем ждать переобучения.
+  // Мелкая поправка внутри запаса окна: переносить веса незачем.
+  if (distance <= kDelayJumpSamples) {
+    _delayHits = 0;
+    _delay = best;
+    return;
+  }
+
+  // Фильтр ещё пуст: терять нечего, и ждать подтверждений незачем — иначе
+  // первые секунды после старта эфира уходят на заведомо неверное окно.
+  float tapPower = 0.0f;
+  for (const float value : _taps) {
+    tapPower += value * value;
+  }
+  if (tapPower < kEmptyFilterPower) {
+    _delay = best;
+    _delayHits = 0;
+    return;
+  }
+
+  const bool sameCandidate =
+      _delayHits > 0
+      && (best > _delayCandidate ? best - _delayCandidate : _delayCandidate - best)
+             <= kDelayJumpSamples;
+
+  if (!sameCandidate) {
+    _delayCandidate = best;
+    _delayHits = 1;
+    return;
+  }
+
+  if (++_delayHits < kDelayPersistHits) {
+    return;
+  }
+
+  const float current = delayScore(count, _delay, micPower, mic);
+  if (bestScore < current * kDelayJumpMargin) {
+    _delayHits = 0;
+    return;
+  }
+
+  // Путь действительно другой. Если фильтр уже сошёлся, веса переносим в новое
+  // окно: обнуление выбрасывало всё выученное, и на музыке фильтр начинал с
+  // нуля каждые несколько секунд. Если он ещё не сошёлся, переносить нечего —
+  // там мусор от неверного выравнивания, и его надо выбросить.
+  if (_erleDb >= kLearnErle) {
+    shiftTaps(delta);
+  } else {
     for (float& value : _taps) {
       value = 0.0f;
     }
   }
 
   _delay = best;
+  _delayHits = 0;
 }
 
 void EchoCanceller::process(int16_t* samples, size_t count) {

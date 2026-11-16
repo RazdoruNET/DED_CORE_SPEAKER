@@ -133,6 +133,8 @@ class EchoCanceller {
   void pushSample(float value);
   void fillStage(size_t span);
   void estimateDelay(const int16_t* mic, size_t count);
+  /// Перенос выученных весов в окно, сдвинутое на delta отсчётов.
+  void shiftTaps(int32_t delta);
   float delayScore(size_t count, uint32_t lag, float micPower, const int16_t* mic) const;
   float referencePower(size_t count, uint32_t lag) const;
 
@@ -161,6 +163,9 @@ class EchoCanceller {
 
   float _taps[kTaps] = {};
   uint32_t _delay = 0;
+  /// Кандидат на новую задержку и сколько измерений подряд он подтверждался.
+  uint32_t _delayCandidate = 0;
+  uint32_t _delayHits = 0;
   uint32_t _framesSinceDelay = 0;
   uint32_t _framesSinceReset = 0;
   bool _adaptNext = true;

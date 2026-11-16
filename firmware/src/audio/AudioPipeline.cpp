@@ -652,6 +652,16 @@ void AudioPipeline::micLoop() {
       vadOff = max<uint32_t>(vadOff, echoFloor * MEDIA_ECHO_OFF_X10 / 10);
     }
 
+    // Глушить эфир можно только тогда, когда эхо действительно вычтено. Пока
+    // компенсатор не сошёлся, фразу открывает сама музыка, и приглушение
+    // превращается в качели: заглушили → уровень упал → фраза закрылась →
+    // эфир вернулся → через 400 мс снова открылась.
+#if SPEAKER_HAS_AEC
+    const bool echoSuppressed = _mediaMode && _aec.erleDb() >= MEDIA_DUCK_MIN_ERLE_DB;
+#else
+    const bool echoSuppressed = false;
+#endif
+
     _noiseFloor = noise;
 
 #if SPEAKER_HAS_AEC
@@ -774,8 +784,13 @@ void AudioPipeline::micLoop() {
     // подтвердилась: иначе стук посуды выключал музыку на доли секунды.
     // Дальше распознаватель получает голос без музыки, а не микс из динамика
     // и человека.
+    //
+    // И только если компенсатор эха действительно гасит эхо. Пока он не сошёлся,
+    // фразу открывает сама музыка: заглушив её, мы сами роняем уровень ниже
+    // порога, фраза закрывается, эфир возвращается — и через 400 мс всё
+    // повторяется. Снаружи это слышно как «музыка икает».
 #if !defined(SPEAKER_MEDIA_NO_DUCK)
-    if (_mediaMode && phraseFrames == MEDIA_DUCK_AFTER_FRAMES) {
+    if (_mediaMode && phraseFrames == MEDIA_DUCK_AFTER_FRAMES && echoSuppressed) {
       _mediaDuckTarget = 0.0f;
     }
 #endif
