@@ -487,6 +487,17 @@ void setup() {
   // не остаётся цельного куска, и радио не включалось вовсе.
   media::prepare();
 
+#if defined(SPEAKER_AEC_DUMP_TONE) && SPEAKER_HAS_AEC
+  // Стенд компенсатора: играем собственный шум через эфирный путь. Сеть и
+  // декодер не нужны — проверяется только вычитание эха.
+  if (audioPipeline.enterMediaMode(44100)) {
+    audioPipeline.startTone();
+    applog::line("[aecdump] стенд: играю тестовый шум");
+  } else {
+    applog::line("[aecdump] эфирный режим не открылся");
+  }
+#endif
+
 #if defined(SPEAKER_SPK_SELFTEST)
   // Стенд: звук проверяется до сети, привязки и TLS. Слышно три тона подряд.
   audioPipeline.speakerSelfTest();

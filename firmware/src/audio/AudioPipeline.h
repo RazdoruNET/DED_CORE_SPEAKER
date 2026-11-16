@@ -69,6 +69,13 @@ class AudioPipeline {
   /// Отдать в усилитель готовый стереопоток. Возвращает число записанных кадров.
   size_t writeMediaPcm(const int16_t* interleaved, size_t frames);
 
+#if defined(SPEAKER_AEC_DUMP_TONE) && SPEAKER_HAS_AEC
+  /// Стенд компенсатора без сети и декодера: сама колонка играет известный
+  /// шум через тот же путь, что и эфир, и подаёт его в референс. Нужно, чтобы
+  /// отделить «компенсатор не работает» от «декор не отдаёт звук».
+  void startTone();
+#endif
+
   /// Плавно погасить эфир за указанное время. Нужно перед переключением порта
   /// на речь: без затухания слышен щелчок и обрывок мелодии.
   void fadeOutMedia(uint32_t milliseconds);
@@ -224,18 +231,30 @@ class AudioPipeline {
 #endif
 
 #if defined(SPEAKER_AEC_DUMP) && SPEAKER_HAS_AEC
-  /// Снимок для разбора эха: 512 мс микрофона до компенсатора и 1 с
+  /// Снимок для разбора эха: 128 мс микрофона до компенсатора и 256 мс
   /// референса — с запасом на задержку тракта.
+#if defined(SPEAKER_AEC_DUMP_TONE)
   static constexpr size_t kDumpMic = 8192;
   static constexpr size_t kDumpRef = 16384;
+#else
+  static constexpr size_t kDumpMic = 2048;
+  static constexpr size_t kDumpRef = 4096;
+#endif
 
   int16_t _dumpMic[kDumpMic] = {};
   size_t _dumpMicWrite = 0;
   size_t _dumpMicValid = 0;
   uint32_t _dumpMediaSince = 0;
-  bool _dumpDone = false;
+  /// Сколько снимков уже снято: первый — на старте эфира, второй — когда
+  /// компенсатор успел поработать.
+  uint8_t _dumpCount = 0;
 
   void dumpEchoOnce();
+
+#if defined(SPEAKER_AEC_DUMP_TONE)
+  static void toneTaskEntry(void* arg);
+  void toneLoop();
+#endif
 #endif
 };
 

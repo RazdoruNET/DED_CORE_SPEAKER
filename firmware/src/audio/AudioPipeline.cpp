@@ -498,10 +498,14 @@ void AudioPipeline::micLoop() {
 #endif
 
 #if defined(SPEAKER_AEC_DUMP) && SPEAKER_HAS_AEC
-    if (_mediaMode && !_dumpDone && _dumpMediaSince != 0
-        && millis() - _dumpMediaSince > 6000 && _dumpMicValid == kDumpMic) {
-      _dumpDone = true;
-      dumpEchoOnce();
+    if (_mediaMode && _dumpMediaSince != 0 && _dumpMicValid == kDumpMic) {
+      const uint32_t elapsed = millis() - _dumpMediaSince;
+      const uint32_t moments = _dumpCount == 0 ? 6000u : 20000u;
+
+      if (_dumpCount < 2 && elapsed > moments) {
+        ++_dumpCount;
+        dumpEchoOnce();
+      }
     }
 #endif
 
@@ -938,6 +942,43 @@ void AudioPipeline::dumpEchoOnce() {
   }
 
   applog::line("[aecdump] done");
+}
+#endif
+
+#if defined(SPEAKER_AEC_DUMP_TONE) && SPEAKER_HAS_AEC
+void AudioPipeline::toneTaskEntry(void* arg) { static_cast<AudioPipeline*>(arg)->toneLoop(); }
+
+void AudioPipeline::toneLoop() {
+  // Белый шум с медленной огибающей: для корреляции он однозначен (в отличие
+  // от чистого тона, у которого пики повторяются через период), а для NLMS —
+  // достаточно богат, чтобы фильтр сошёлся.
+  static int16_t stereo[256 * 2];
+  uint32_t seed = 0x1234567u;
+  double phase = 0.0;
+
+  for (;;) {
+    for (size_t i = 0; i < 256; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      const int32_t noise = static_cast<int32_t>((seed >> 9) & 0x3FFF) - 8192;
+
+      phase += 2.0 * PI * 1.5 / static_cast<double>(_mediaRate);
+      if (phase > 2.0 * PI) {
+        phase -= 2.0 * PI;
+      }
+      const double env = 0.55 + 0.45 * sin(phase);
+
+      const int32_t value = static_cast<int32_t>(noise * env * 1.6);
+      const int16_t pcm = static_cast<int16_t>(value > 32767 ? 32767 : (value < -32768 ? -32768 : value));
+      stereo[i * 2] = pcm;
+      stereo[i * 2 + 1] = pcm;
+    }
+
+    writeMediaPcm(stereo, 256);
+  }
+}
+
+void AudioPipeline::startTone() {
+  xTaskCreatePinnedToCore(toneTaskEntry, "aec-tone", 4096, this, 6, nullptr, 0);
 }
 #endif
 
