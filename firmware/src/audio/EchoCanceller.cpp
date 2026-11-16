@@ -148,6 +148,32 @@ void EchoCanceller::pushSample(float value) {
   _count.store(index + 1, std::memory_order_release);
 }
 
+size_t EchoCanceller::copyReference(int16_t* out, size_t count) const {
+  if (out == nullptr || count == 0) {
+    return 0;
+  }
+
+  const uint32_t total = _count.load(std::memory_order_acquire);
+  const size_t available = total < kHistory ? total : kHistory;
+  const size_t take = count < available ? count : available;
+  if (take == 0) {
+    return 0;
+  }
+
+  const size_t oldest = total - static_cast<uint32_t>(take);
+  const size_t base = oldest % kHistory;
+  const size_t tail = kHistory - base;
+
+  if (take <= tail) {
+    memcpy(out, _history + base, take * sizeof(int16_t));
+  } else {
+    memcpy(out, _history + base, tail * sizeof(int16_t));
+    memcpy(out + tail, _history, (take - tail) * sizeof(int16_t));
+  }
+
+  return take;
+}
+
 void EchoCanceller::pushPlayback(const int16_t* interleaved, size_t frames, uint32_t rate) {
   if (!_ready || interleaved == nullptr || frames == 0 || rate == 0) {
     return;

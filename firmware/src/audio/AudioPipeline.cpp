@@ -1,5 +1,6 @@
 #include "audio/AudioPipeline.h"
 
+#include <cstdio>
 #include <driver/i2s.h>
 
 #include "app/Trace.h"
@@ -470,12 +471,37 @@ void AudioPipeline::micLoop() {
     }
 #endif
 
+#if defined(SPEAKER_AEC_DUMP) && SPEAKER_HAS_AEC
+    // Снимок микрофона до компенсатора: по нему вместе с референсом видно,
+    // есть ли в референсе эхо и на какой задержке.
+    if (_mediaMode) {
+      if (_dumpMediaSince == 0) {
+        _dumpMediaSince = millis();
+      }
+      for (size_t i = 0; i < used; ++i) {
+        _dumpMic[_dumpMicWrite] = pixelBuffer[i];
+        _dumpMicWrite = (_dumpMicWrite + 1) % kDumpMic;
+        if (_dumpMicValid < kDumpMic) {
+          ++_dumpMicValid;
+        }
+      }
+    }
+#endif
+
 #if SPEAKER_HAS_AEC
     // Эхо собственной музыки вычитается до детектора речи. Без этого порог
     // приходится поднимать выше самой музыки, и колонка «глохнет» на всё время
     // эфира: в поток уходит музыка, а голос поверх неё не разобрать.
     if (_mediaMode) {
       _aec.process(pixelBuffer, used);
+    }
+#endif
+
+#if defined(SPEAKER_AEC_DUMP) && SPEAKER_HAS_AEC
+    if (_mediaMode && !_dumpDone && _dumpMediaSince != 0
+        && millis() - _dumpMediaSince > 6000 && _dumpMicValid == kDumpMic) {
+      _dumpDone = true;
+      dumpEchoOnce();
     }
 #endif
 
@@ -879,6 +905,41 @@ void AudioPipeline::speakerSelfTest() {
 
   applog::line("[spk] проверка выхода закончена");
 }
+
+#if defined(SPEAKER_AEC_DUMP) && SPEAKER_HAS_AEC
+void AudioPipeline::dumpEchoOnce() {
+  static int16_t reference[kDumpRef];
+  static char line[132];
+
+  const size_t refCount = _aec.copyReference(reference, kDumpRef);
+  applog::printf("[aecdump] rate %u, mic %u, ref %u, задержка %u мс, гашение %.1f дБ\n",
+                 static_cast<unsigned>(_mediaRate), static_cast<unsigned>(kDumpMic),
+                 static_cast<unsigned>(refCount),
+                 static_cast<unsigned>(_aec.delayMs()), _aec.erleDb());
+
+  // Оба снимка заканчиваются одним моментом. Микрофон лежит в кольце от самого
+  // старого отсчёта к самому новому, референс уже развёрнут так же.
+  for (size_t pass = 0; pass < 2; ++pass) {
+    const int16_t* data = pass == 0 ? _dumpMic : reference;
+    const size_t count = pass == 0 ? kDumpMic : refCount;
+    const size_t ring = pass == 0 ? kDumpMic : kDumpRef;
+    const size_t start = pass == 0 ? _dumpMicWrite : 0;
+    const char* tag = pass == 0 ? "m" : "r";
+
+    for (size_t offset = 0; offset < count; offset += 24) {
+      const size_t take = count - offset < 24 ? count - offset : 24;
+      size_t at = 0;
+      for (size_t i = 0; i < take; ++i) {
+        const uint16_t value = static_cast<uint16_t>(data[(start + offset + i) % ring]);
+        at += snprintf(line + at, sizeof(line) - at, "%04x", value);
+      }
+      applog::printf("[aecdump] %s %s\n", tag, line);
+    }
+  }
+
+  applog::line("[aecdump] done");
+}
+#endif
 
 void AudioPipeline::leaveMediaMode() {
   if (!_mediaMode) {

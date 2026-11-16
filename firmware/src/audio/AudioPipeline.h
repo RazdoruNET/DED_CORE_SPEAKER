@@ -222,6 +222,21 @@ class AudioPipeline {
 #if SPEAKER_HAS_AEC
   EchoCanceller _aec;
 #endif
+
+#if defined(SPEAKER_AEC_DUMP) && SPEAKER_HAS_AEC
+  /// Снимок для разбора эха: 512 мс микрофона до компенсатора и 1 с
+  /// референса — с запасом на задержку тракта.
+  static constexpr size_t kDumpMic = 8192;
+  static constexpr size_t kDumpRef = 16384;
+
+  int16_t _dumpMic[kDumpMic] = {};
+  size_t _dumpMicWrite = 0;
+  size_t _dumpMicValid = 0;
+  uint32_t _dumpMediaSince = 0;
+  bool _dumpDone = false;
+
+  void dumpEchoOnce();
+#endif
 };
 
 extern AudioPipeline audioPipeline;
