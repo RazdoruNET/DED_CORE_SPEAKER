@@ -12,7 +12,10 @@ namespace {
 // не находила эхо вовсе (гашение 1.2 дБ) и оставалась на начальном значении.
 
 // Порог корреляции, ниже которого оценка задержки считается случайной.
-constexpr float kDelayMinScore = 0.65f;
+// На одном кадре 20 мс пик на живой плате не дотягивал до 0.65 вовсе, и
+// задержка не обновлялась никогда. На окне 160 мс пик устойчив выше 0.45,
+// а от случайных скачков защищает накопление подтверждений.
+constexpr float kDelayMinScore = 0.45f;
 
 // Насколько новая задержка должна быть лучше текущей, чтобы её принять.
 constexpr float kDelayJumpMargin = 1.15f;
@@ -39,7 +42,7 @@ constexpr float kEmptyFilterPower = 1.0e-8f;
 // «микрофон громче эха» запретила бы подстройку навсегда: на живой плате
 // остаток эха так и застревал на 0.5 дБ. Поэтому учиться фильтр перестаёт
 // только после настоящего схождения, а не по таймеру.
-constexpr float kLearnErle = 6.0f;
+constexpr float kLearnErle = 40.0f;
 
 // Уровни внутри фильтра нормированы к единице: так и числа в float остаются в
 // удобном диапазоне, и шаг NLMS не зависит от разрядности АЦП.
@@ -59,6 +62,7 @@ void EchoCanceller::reset() {
   _delay = kDelaySeed;
   _delayCandidate = kDelaySeed;
   _delayHits = 0;
+  _micRingCount = 0;
   _framesSinceDelay = 0;
   _framesSinceReset = 0;
   _adaptNext = true;
@@ -307,19 +311,12 @@ void EchoCanceller::estimateDelay(const int16_t* mic, size_t count) {
   uint32_t best = _delay;
   float bestScore = 0.0f;
 
-  // Грубо по всей шкале с шагом 4, потом уточняем вокруг найденного пика:
-  // шаг 1 по всей шкале стоил бы вчетверо дороже без выигрыша в точности.
-  for (uint32_t lag = 0; lag <= kMaxDelay; lag += 4) {
-    const float score = delayScore(count, lag, micPower, mic);
-    if (score > bestScore) {
-      bestScore = score;
-      best = lag;
-    }
-  }
-
-  const uint32_t coarse = best;
-  const uint32_t from = coarse > 3 ? coarse - 3 : 0;
-  for (uint32_t lag = from; lag <= coarse + 3 && lag <= kMaxDelay; ++lag) {
+  // Шаг 1 по всей шкале. Раньше шли с шагом 4 и уточняли вокруг найденного
+  // пика, и это промахивалось: на шумовом сигнале пик корреляции шириной в
+  // один отсчёт, поэтому шаг 4 просто не попадал в него, а «лучшим» оказывался
+  // случайный всплеск в другом месте. Окно 160 мс даёт 2560 × 1201 операций
+  // раз в секунду — для S3 это доли процента загрузки.
+  for (uint32_t lag = 0; lag <= kMaxDelay; ++lag) {
     const float score = delayScore(count, lag, micPower, mic);
     if (score > bestScore) {
       bestScore = score;
@@ -367,10 +364,14 @@ void EchoCanceller::estimateDelay(const int16_t* mic, size_t count) {
     return;
   }
 
+  // Кандидат считается тем же, если он в пределах 4 мс: оценка по короткому
+  // окну гуляет на ±3 мс, и с допуском 8 отсчётов подтверждения не набирались
+  // никогда — задержка оставалась начальной.
+  constexpr uint32_t kCandidateTolerance = 64;
   const bool sameCandidate =
       _delayHits > 0
       && (best > _delayCandidate ? best - _delayCandidate : _delayCandidate - best)
-             <= kDelayJumpSamples;
+             <= kCandidateTolerance;
 
   if (!sameCandidate) {
     _delayCandidate = best;
@@ -410,7 +411,14 @@ void EchoCanceller::process(int16_t* samples, size_t count) {
   }
 
   const uint32_t total = _count.load(std::memory_order_acquire);
-  const size_t span = count + kMaxDelay + kTaps;
+
+  for (size_t i = 0; i < count; ++i) {
+    _micRing[_micRingCount % kDelaySpan] = samples[i];
+    ++_micRingCount;
+  }
+
+  const size_t micSpan = _micRingCount < kDelaySpan ? _micRingCount : kDelaySpan;
+  const size_t span = micSpan + kMaxDelay + kTaps;
   if (total < span + 8) {
     return;
   }
@@ -418,7 +426,16 @@ void EchoCanceller::process(int16_t* samples, size_t count) {
   fillStage(span);
 
   if (_framesSinceDelay == 0) {
-    estimateDelay(samples, count);
+    // Задержка ищется по всему накопленному окну, а не по одному кадру: на
+    // кадре 20 мс у ритмичного сигнала несколько почти равных пиков.
+    static int16_t micWindow[kDelaySpan];
+    const size_t start = _micRingCount - static_cast<uint32_t>(micSpan);
+
+    for (size_t i = 0; i < micSpan; ++i) {
+      micWindow[i] = _micRing[(start + i) % kDelaySpan];
+    }
+
+    estimateDelay(micWindow, micSpan);
     _framesSinceDelay = kDelayEveryFrames;
   } else {
     --_framesSinceDelay;
@@ -429,16 +446,25 @@ void EchoCanceller::process(int16_t* samples, size_t count) {
   }
 
   // Учимся, пока не сошлись: большой шаг для быстрого схождения, малый — когда
-  // гашение уже есть и надо не разболтать веса.
+  // гашение уже есть и надо не разболтать веса. Шаг меняется плавно, а не
+  // ступенькой: на пороге 6 дБ фильтр «замирал» недосведённым и остаток
+  // застревал на 15 дБ вместо 25.
   const bool learning = _erleDb < kLearnErle;
   const bool adapt = learning || _adaptNext;
-  const float mu = learning ? kMuWarmup : kMuSteady;
+  float learned = _erleDb / kLearnErle;
+  if (learned > 1.0f) {
+    learned = 1.0f;
+  } else if (learned < 0.0f) {
+    learned = 0.0f;
+  }
+  const float mu = kMuWarmup + (kMuSteady - kMuWarmup) * learned;
 
   // Окно фильтра начинается на kDelayMargin раньше найденной задержки.
   // В _stage кадр микрофона начинается с индекса kMaxDelay + kTaps: перед ним
   // лежит ровно столько отсчётов референса, сколько нужно фильтру.
   const uint32_t windowStart = _delay > kDelayMargin ? _delay - kDelayMargin : 0;
-  const size_t base = kMaxDelay + kTaps - windowStart;
+  // Кадр занимает последние count отсчётов окна; ищем его начало.
+  const size_t base = span - count - windowStart;
 
   float micPower = 0.0f;
   float echoPower = 0.0f;
@@ -498,7 +524,15 @@ void EchoCanceller::process(int16_t* samples, size_t count) {
                || micRms < kDoubleTalkRatio * echoRms + kDoubleTalkRms;
 
   if (adapt && micRms > 0.003f && echoRms > 1.5e-4f) {
-    const float instant = 10.0f * log10f((micPower + 1.0f) / (residualPower + 1.0f));
-    _erleDb += (instant - _erleDb) * 0.1f;
+    // Сравниваем средние мощности кадра, а не суммы, и без прибавленной
+    // единицы: сигнал нормирован к единице, суммы порядка 0.3, и «+1» в
+    // числителе и знаменателе превращала любое гашение в ноль.
+    const float micMean = micPower * invCount;
+    const float residualMean = residualPower * invCount;
+    if (micMean > 1.0e-9f) {
+      const float instant =
+          10.0f * log10f(micMean / (residualMean > 1.0e-9f ? residualMean : 1.0e-9f));
+      _erleDb += (instant - _erleDb) * 0.1f;
+    }
   }
 }
